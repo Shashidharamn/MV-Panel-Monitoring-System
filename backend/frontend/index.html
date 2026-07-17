@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>MV Panel Monitoring System</title>
+
+<link rel="stylesheet" href="style.css">
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+</head>
+
+<body>
+
+<!-- Header -->
+
+<header>
+
+<h1>⚡ MV PANEL MONITORING SYSTEM</h1>
+
+<h3>New India Electricals</h3>
+
+<div id="clock"></div>
+
+</header>
+
+<!-- Status Bar -->
+
+<div class="statusBar">
+
+<div class="statusCard">
+<h3>Communication</h3>
+<p class="green">🟢 ONLINE</p>
+</div>
+
+<div class="statusCard">
+<h3>Panel Status</h3>
+<p class="green">🟢 HEALTHY</p>
+</div>
+
+<div class="statusCard">
+<h3>Last Update</h3>
+<p id="lastUpdate" class="green">Live</p>
+</div>
+
+</div>
+
+<!-- Parameter Cards -->
+
+<<!-- Parameter Cards -->
+
+<div class="container">
+
+<div class="card">
+<h2>R Phase Voltage</h2>
+<p id="vr">0.00 V</p>
+</div>
+
+<div class="card">
+<h2>Y Phase Voltage</h2>
+<p id="vy">0.00 V</p>
+</div>
+
+<div class="card">
+<h2>B Phase Voltage</h2>
+<p id="vb">0.00 V</p>
+</div>
+
+<div class="card">
+<h2>R Phase Current</h2>
+<p id="ir">0.00 A</p>
+</div>
+
+<div class="card">
+<h2>Y Phase Current</h2>
+<p id="iy">0.00 A</p>
+</div>
+
+<div class="card">
+<h2>Frequency</h2>
+<p id="frequency">0.00 Hz</p>
+</div>
+
+<div class="card">
+<h2>PF R</h2>
+<p id="pf_r">0.00</p>
+</div>
+
+<div class="card">
+<h2>PF Y</h2>
+<p id="pf_y">0.00</p>
+</div>
+
+<div class="card">
+<h2>PF B</h2>
+<p id="pf_b">0.00</p>
+</div>
+
+<div class="card">
+<h2>Total PF</h2>
+<p id="pf_total">0.00</p>
+</div>
+
+<div class="card">
+<h2>R Phase Power</h2>
+<p id="power_r">0.00 kW</p>
+</div>
+
+<div class="card">
+<h2>Y Phase Power</h2>
+<p id="power_y">0.00 kW</p>
+</div>
+
+</div>
+<!-- Graph -->
+
+<div class="graph-container">
+
+<div class="graph">
+
+<h2>Voltage Trend</h2>
+
+<canvas id="voltageChart"></canvas>
+
+</div>
+
+</div>
+
+<!-- Footer -->
+
+<footer>
+
+<h3>MV Panel Monitoring System | Internship Project | New India Electricals</h3>
+
+</footer>
+
+<script src="script.js"></script>
+
+</body>
+
+</html>
