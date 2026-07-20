@@ -37,6 +37,7 @@ class SensorData(BaseModel):
     power_r: float
     power_y: float
 
+    error_message: str
 
 # -----------------------------
 # Home API
@@ -56,7 +57,7 @@ def receive_data(data: SensorData):
     cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO sensor_data
+                INSERT INTO sensor_data
         (
             vr,
             vy,
@@ -69,11 +70,12 @@ def receive_data(data: SensorData):
             pf_b,
             pf_total,
             power_r,
-            power_y
+            power_y,
+            error_message
         )
         VALUES
         (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
         )
     """, (
         data.vr,
@@ -87,7 +89,8 @@ def receive_data(data: SensorData):
         data.pf_b,
         data.pf_total,
         data.power_r,
-        data.power_y
+        data.power_y,
+        data.error_message
     ))
 
     conn.commit()
@@ -111,24 +114,25 @@ def latest_data():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT
-            id,
-            vr,
-            vy,
-            vb,
-            ir,
-            iy,
-            frequency,
-            pf_r,
-            pf_y,
-            pf_b,
-            pf_total,
-            power_r,
-            power_y,
-            created_at
-        FROM sensor_data
-        ORDER BY id DESC
-        LIMIT 1;
+                       SELECT
+                            id,
+                            vr,
+                            vy,
+                            vb,
+                            ir,
+                            iy,
+                            frequency,
+                            pf_r,
+                            pf_y,
+                            pf_b,
+                            pf_total,
+                            power_r,
+                            power_y,
+                            error_message,
+                            created_at
+                        FROM sensor_data
+                        ORDER BY id DESC
+                        LIMIT 1;
     """)
 
     row = cursor.fetchone()
@@ -153,5 +157,6 @@ def latest_data():
         "pf_total": row[10],
         "power_r": row[11],
         "power_y": row[12],
-        "created_at": row[13]
+        "error_message": row[13],
+        "created_at": row[14]
     }
