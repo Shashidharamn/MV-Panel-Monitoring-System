@@ -37,6 +37,8 @@ class SensorData(BaseModel):
     power_r: float
     power_y: float
 
+    status: str
+
     error_message: str
 
 # -----------------------------
@@ -57,41 +59,43 @@ def receive_data(data: SensorData):
     cursor = conn.cursor()
 
     cursor.execute("""
-                INSERT INTO sensor_data
-        (
-            vr,
-            vy,
-            vb,
-            ir,
-            iy,
-            frequency,
-            pf_r,
-            pf_y,
-            pf_b,
-            pf_total,
-            power_r,
-            power_y,
-            error_message
-        )
+               INSERT INTO sensor_data
+                    (
+                        vr,
+                        vy,
+                        vb,
+                        ir,
+                        iy,
+                        frequency,
+                        pf_r,
+                        pf_y,
+                        pf_b,
+                        pf_total,
+                        power_r,
+                        power_y,
+                        status,
+                        error_message
+                    )
         VALUES
-        (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-        )
+                (
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                )
     """, (
-        data.vr,
-        data.vy,
-        data.vb,
-        data.ir,
-        data.iy,
-        data.frequency,
-        data.pf_r,
-        data.pf_y,
-        data.pf_b,
-        data.pf_total,
-        data.power_r,
-        data.power_y,
-        data.error_message
-    ))
+    data.vr,
+    data.vy,
+    data.vb,
+    data.ir,
+    data.iy,
+    data.frequency,
+    data.pf_r,
+    data.pf_y,
+    data.pf_b,
+    data.pf_total,
+    data.power_r,
+    data.power_y,
+    data.status,
+    data.error_message
+))
 
     conn.commit()
 
@@ -128,6 +132,7 @@ def latest_data():
                             pf_total,
                             power_r,
                             power_y,
+                            status,
                             error_message,
                             created_at
                         FROM sensor_data
@@ -144,19 +149,20 @@ def latest_data():
         return {"message": "No Data Available"}
 
     return {
-        "id": row[0],
-        "vr": row[1],
-        "vy": row[2],
-        "vb": row[3],
-        "ir": row[4],
-        "iy": row[5],
-        "frequency": row[6],
-        "pf_r": row[7],
-        "pf_y": row[8],
-        "pf_b": row[9],
-        "pf_total": row[10],
-        "power_r": row[11],
-        "power_y": row[12],
-        "error_message": row[13],
-        "created_at": row[14]
-    }
+    "id": row[0],
+    "vr": row[1],
+    "vy": row[2],
+    "vb": row[3],
+    "ir": row[4],
+    "iy": row[5],
+    "frequency": row[6],
+    "pf_r": row[7],
+    "pf_y": row[8],
+    "pf_b": row[9],
+    "pf_total": row[10],
+    "power_r": row[11],
+    "power_y": row[12],
+    "status": row[13],
+    "error_message": row[14],
+    "created_at": row[15]
+}
