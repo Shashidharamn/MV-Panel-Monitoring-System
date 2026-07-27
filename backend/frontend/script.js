@@ -4,7 +4,7 @@
 // script.js
 // =====================================
  
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE =  "https://mv-panel-monitoring-system.onrender.com";
  
 // ================================
 // Settings (persisted in localStorage — this is a real

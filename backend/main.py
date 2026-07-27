@@ -169,43 +169,39 @@ def latest_data():
         "error_message": row[14],
         "created_at": row[15]
     }
-@app.get("/history")
-def history():
+from fastapi import Query
 
+@app.get("/history")
+def get_history(
+    from_date: str = Query(None, alias="from"),
+    to_date: str = Query(None, alias="to"),
+    interval: int = Query(60)
+):
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT
-            id,
-            vr,
-            vy,
-            vb,
-            ir,
-            iy,
-            frequency,
-            pf_r,
-            pf_y,
-            pf_b,
-            pf_total,
-            power_r,
-            power_y,
-            status,
-            error_message,
-            created_at
-        FROM sensor_data
-        ORDER BY id DESC;
-    """)
+    if from_date and to_date:
+        cursor.execute("""
+            SELECT *
+            FROM sensor_data
+            WHERE DATE(created_at) BETWEEN %s AND %s
+            ORDER BY created_at ASC
+        """, (from_date, to_date))
+    else:
+        cursor.execute("""
+            SELECT *
+            FROM sensor_data
+            ORDER BY created_at ASC
+        """)
 
     rows = cursor.fetchall()
-
     cursor.close()
     conn.close()
 
-    result = []
+    history = []
 
     for row in rows:
-        result.append({
+        history.append({
             "id": row[0],
             "vr": row[1],
             "vy": row[2],
@@ -221,7 +217,7 @@ def history():
             "power_y": row[12],
             "status": row[13],
             "error_message": row[14],
-            "created_at": row[15]
+            "timestamp": row[15].strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    return result
+    return history
