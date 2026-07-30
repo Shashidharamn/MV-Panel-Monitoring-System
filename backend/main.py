@@ -20,26 +20,41 @@ app.add_middleware(
 # Data Model
 # -----------------------------
 class SensorData(BaseModel):
+    panel_id: str
 
-    vr: float
-    vy: float
-    vb: float
+    relay_i1: float
+    relay_i2: float
+    relay_i3: float
+    relay_i0: float
 
-    ir: float
-    iy: float
+    pickup_phase: float
+    pickup_earth: float
 
-    frequency: float
+    overcurrent_fault: bool
+    earth_fault: bool
 
-    pf_r: float
-    pf_y: float
-    pf_b: float
-    pf_total: float
+    meter_v_r: float
+    meter_v_y: float
+    meter_v_b: float
 
-    power_r: float
-    power_y: float
+    meter_i_r: float
+    meter_i_y: float
+    meter_i_b: float
 
-    status: str
-    error_message: str
+    meter_frequency: float
+
+    meter_pf_r: float
+    meter_pf_y: float
+    meter_pf_b: float
+    meter_pf_t: float
+
+    meter_p_r: float
+    meter_p_y: float
+    meter_p_b: float
+    meter_p_t: float
+
+    temperature: float
+    humidity: float
 
 
 # -----------------------------
@@ -61,44 +76,94 @@ def receive_data(data: SensorData):
 
     cursor.execute("""
         INSERT INTO sensor_data
-        (
-            vr,
-            vy,
-            vb,
-            ir,
-            iy,
-            frequency,
-            pf_r,
-            pf_y,
-            pf_b,
-            pf_total,
-            power_r,
-            power_y,
-            status,
-            error_message,
-            created_at
-        )
-        VALUES
-        (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-            CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
-        )
+(
+    panel_id,
+
+    relay_i1,
+    relay_i2,
+    relay_i3,
+    relay_i0,
+
+    pickup_phase,
+    pickup_earth,
+
+    overcurrent_fault,
+    earth_fault,
+
+    meter_v_r,
+    meter_v_y,
+    meter_v_b,
+
+    meter_i_r,
+    meter_i_y,
+    meter_i_b,
+
+    meter_frequency,
+
+    meter_pf_r,
+    meter_pf_y,
+    meter_pf_b,
+    meter_pf_t,
+
+    meter_p_r,
+    meter_p_y,
+    meter_p_b,
+    meter_p_t,
+
+    temperature,
+    humidity,
+    timestamp
+)
+VALUES
+(
+    %s,%s,%s,%s,%s,
+    %s,%s,
+    %s,%s,
+    %s,%s,%s,
+    %s,%s,%s,
+    %s,
+    %s,%s,%s,%s,
+    %s,%s,%s,%s,
+    %s,%s,
+    CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
+)
     """, (
-        data.vr,
-        data.vy,
-        data.vb,
-        data.ir,
-        data.iy,
-        data.frequency,
-        data.pf_r,
-        data.pf_y,
-        data.pf_b,
-        data.pf_total,
-        data.power_r,
-        data.power_y,
-        data.status,
-        data.error_message
-    ))
+    data.panel_id,
+
+    data.relay_i1,
+    data.relay_i2,
+    data.relay_i3,
+    data.relay_i0,
+
+    data.pickup_phase,
+    data.pickup_earth,
+
+    data.overcurrent_fault,
+    data.earth_fault,
+
+    data.meter_v_r,
+    data.meter_v_y,
+    data.meter_v_b,
+
+    data.meter_i_r,
+    data.meter_i_y,
+    data.meter_i_b,
+
+    data.meter_frequency,
+
+    data.meter_pf_r,
+    data.meter_pf_y,
+    data.meter_pf_b,
+    data.meter_pf_t,
+
+    data.meter_p_r,
+    data.meter_p_y,
+    data.meter_p_b,
+    data.meter_p_t,
+
+    data.temperature,
+    data.humidity
+))
 
     conn.commit()
 
