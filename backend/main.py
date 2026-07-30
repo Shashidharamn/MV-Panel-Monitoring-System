@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from db import get_connection
@@ -187,25 +187,48 @@ def latest_data():
 
     cursor.execute("""
         SELECT
-            id,
-            vr,
-            vy,
-            vb,
-            ir,
-            iy,
-            frequency,
-            pf_r,
-            pf_y,
-            pf_b,
-            pf_total,
-            power_r,
-            power_y,
-            status,
-            error_message,
-            created_at
-        FROM sensor_data
-        ORDER BY id DESC
-        LIMIT 1;
+    id,
+    panel_id,
+
+    relay_i1,
+    relay_i2,
+    relay_i3,
+    relay_i0,
+
+    pickup_phase,
+    pickup_earth,
+
+    overcurrent_fault,
+    earth_fault,
+
+    meter_v_r,
+    meter_v_y,
+    meter_v_b,
+
+    meter_i_r,
+    meter_i_y,
+    meter_i_b,
+
+    meter_frequency,
+
+    meter_pf_r,
+    meter_pf_y,
+    meter_pf_b,
+    meter_pf_t,
+
+    meter_p_r,
+    meter_p_y,
+    meter_p_b,
+    meter_p_t,
+
+    temperature,
+    humidity,
+
+    timestamp
+
+FROM sensor_data
+ORDER BY id DESC
+LIMIT 1;
     """)
 
     row = cursor.fetchone()
@@ -217,30 +240,53 @@ def latest_data():
         return {"message": "No Data Available"}
 
     return {
-        "id": row[0],
-        "vr": row[1],
-        "vy": row[2],
-        "vb": row[3],
-        "ir": row[4],
-        "iy": row[5],
-        "frequency": row[6],
-        "pf_r": row[7],
-        "pf_y": row[8],
-        "pf_b": row[9],
-        "pf_total": row[10],
-        "power_r": row[11],
-        "power_y": row[12],
-        "status": row[13],
-        "error_message": row[14],
-        "created_at": row[15]
-    }
-from fastapi import Query
+    "id": row[0],
+    "panel_id": row[1],
+
+    "relay_i1": row[2],
+    "relay_i2": row[3],
+    "relay_i3": row[4],
+    "relay_i0": row[5],
+
+    "pickup_phase": row[6],
+    "pickup_earth": row[7],
+
+    "overcurrent_fault": row[8],
+    "earth_fault": row[9],
+
+    "meter_v_r": row[10],
+    "meter_v_y": row[11],
+    "meter_v_b": row[12],
+
+    "meter_i_r": row[13],
+    "meter_i_y": row[14],
+    "meter_i_b": row[15],
+
+    "meter_frequency": row[16],
+
+    "meter_pf_r": row[17],
+    "meter_pf_y": row[18],
+    "meter_pf_b": row[19],
+    "meter_pf_t": row[20],
+
+    "meter_p_r": row[21],
+    "meter_p_y": row[22],
+    "meter_p_b": row[23],
+    "meter_p_t": row[24],
+
+    "temperature": row[25],
+    "humidity": row[26],
+
+    "timestamp": row[27]
+}
+
+
 
 @app.get("/history")
 def get_history(
     from_date: str = Query(None, alias="from"),
-    to_date: str = Query(None, alias="to"),
-    interval: int = Query(60)
+    to_date: str = Query(None, alias="to")
+ 
 ):
     conn = get_connection()
     cursor = conn.cursor()
@@ -249,14 +295,14 @@ def get_history(
         cursor.execute("""
             SELECT *
             FROM sensor_data
-            WHERE DATE(created_at) BETWEEN %s AND %s
-            ORDER BY created_at ASC
+            WHERE DATE(timestamp) BETWEEN %s AND %s
+            ORDER BY timestamp ASC
         """, (from_date, to_date))
     else:
-        cursor.execute("""
+                cursor.execute("""
             SELECT *
             FROM sensor_data
-            ORDER BY created_at ASC
+            ORDER BY timestamp ASC
         """)
 
     rows = cursor.fetchall()
@@ -267,22 +313,44 @@ def get_history(
 
     for row in rows:
         history.append({
-            "id": row[0],
-            "vr": row[1],
-            "vy": row[2],
-            "vb": row[3],
-            "ir": row[4],
-            "iy": row[5],
-            "frequency": row[6],
-            "pf_r": row[7],
-            "pf_y": row[8],
-            "pf_b": row[9],
-            "pf_total": row[10],
-            "power_r": row[11],
-            "power_y": row[12],
-            "status": row[13],
-            "error_message": row[14],
-            "timestamp": row[15].strftime("%Y-%m-%d %H:%M:%S")
-        })
+    "id": row[0],
+    "panel_id": row[1],
+
+    "relay_i1": row[2],
+    "relay_i2": row[3],
+    "relay_i3": row[4],
+    "relay_i0": row[5],
+
+    "pickup_phase": row[6],
+    "pickup_earth": row[7],
+
+    "overcurrent_fault": row[8],
+    "earth_fault": row[9],
+
+    "meter_v_r": row[10],
+    "meter_v_y": row[11],
+    "meter_v_b": row[12],
+
+    "meter_i_r": row[13],
+    "meter_i_y": row[14],
+    "meter_i_b": row[15],
+
+    "meter_frequency": row[16],
+
+    "meter_pf_r": row[17],
+    "meter_pf_y": row[18],
+    "meter_pf_b": row[19],
+    "meter_pf_t": row[20],
+
+    "meter_p_r": row[21],
+    "meter_p_y": row[22],
+    "meter_p_b": row[23],
+    "meter_p_t": row[24],
+
+    "temperature": row[25],
+    "humidity": row[26],
+
+    "timestamp": row[27].strftime("%Y-%m-%d %H:%M:%S")
+})
 
     return history
