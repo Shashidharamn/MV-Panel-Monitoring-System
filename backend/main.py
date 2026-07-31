@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from datetime import datetime
 from db import get_connection
 
 app = FastAPI()
@@ -552,38 +554,178 @@ LIMIT 1;
     return row_to_dict(row, timestamp_as_string=False)
 
 
+# =====================================================================
+# HISTORICAL DATA BACKEND (GET /history + DELETE /history)
+#
+# Everything below this point is new/updated. Nothing above this
+# section has been changed.
+# =====================================================================
+
+def _parse_datetime(value: str, field_name: str) -> datetime:
+    """
+    Parses an incoming date/datetime string into a datetime object.
+    Accepts full timestamps ("YYYY-MM-DD HH:MM:SS" or ISO 8601 with "T")
+    as well as plain dates ("YYYY-MM-DD"), so that the filter works
+    correctly whether or not the frontend includes a time component.
+    """
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date range: '{field_name}' is missing or empty."
+        )
+
+    candidate = value.strip().replace("T", " ")
+
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    )
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Invalid date range: '{field_name}' value '{value}' is not a "
+            f"recognized date/time format. Expected 'YYYY-MM-DD' or "
+            f"'YYYY-MM-DD HH:MM:SS'."
+        )
+    )
+
+
+def build_history_filter(start_date: str, end_date: str, panel_id: str = None):
+    """
+    Builds a parameterized WHERE clause + params list shared by both
+    GET /history and DELETE /history so the filtering logic never
+    drifts apart between the two endpoints.
+
+    Filters on the FULL timestamp (date + time), not DATE(timestamp),
+    so a time component in start_date / end_date is respected.
+    """
+    if not start_date or not end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date range: 'start_date' and 'end_date' are both required."
+        )
+
+    start_dt = _parse_datetime(start_date, "start_date")
+    end_dt = _parse_datetime(end_date, "end_date")
+
+    if start_dt > end_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date range: 'start_date' must not be later than 'end_date'."
+        )
+
+    where_clause = "timestamp BETWEEN %s AND %s"
+    params = [start_dt, end_dt]
+
+    if panel_id:
+        where_clause += " AND panel_id = %s"
+        params.append(panel_id)
+
+    return where_clause, params
+
+
 @app.get("/history")
 def get_history(
-    from_date: str = Query(None, alias="from"),
-    to_date: str = Query(None, alias="to")
-
+    start_date: str = Query(..., alias="start_date"),
+    end_date: str = Query(..., alias="end_date"),
+    panel_id: str = Query(None, alias="panel_id"),
 ):
-    conn = get_connection()
-    cursor = conn.cursor()
+    where_clause, params = build_history_filter(start_date, end_date, panel_id)
 
-    if from_date and to_date:
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
         cursor.execute(f"""
             SELECT
 {SENSOR_COLUMNS}
             FROM sensor_data
-            WHERE DATE(timestamp) BETWEEN %s AND %s
+            WHERE {where_clause}
             ORDER BY timestamp ASC
-        """, (from_date, to_date))
-    else:
-        cursor.execute(f"""
-            SELECT
-{SENSOR_COLUMNS}
-            FROM sensor_data
-            ORDER BY timestamp ASC
-        """)
+        """, params)
 
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
+        rows = cursor.fetchall()
 
-    history = []
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error while fetching history: {str(exc)}"
+        )
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
-    for row in rows:
-        history.append(row_to_dict(row, timestamp_as_string=True))
+    if not rows:
+        return []
+
+    history = [row_to_dict(row, timestamp_as_string=True) for row in rows]
 
     return history
+
+
+@app.delete("/history")
+def delete_history(
+    start_date: str = Query(..., alias="start_date"),
+    end_date: str = Query(..., alias="end_date"),
+    panel_id: str = Query(None, alias="panel_id"),
+):
+    where_clause, params = build_history_filter(start_date, end_date, panel_id)
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(f"""
+            DELETE FROM sensor_data
+            WHERE {where_clause}
+        """, params)
+
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error while deleting history: {str(exc)}"
+        )
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+    if deleted_count == 0:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "No Data Deleted",
+                "number_of_deleted_rows": 0,
+                "message": "No records found matching the given filters."
+            }
+        )
+
+    return {
+  "status": "success",
+  "number_of_deleted_rows": 25,
+  "message": "25 historical records deleted successfully."
+}

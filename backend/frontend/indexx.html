@@ -9,9 +9,12 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <!-- Chart.js & MQTT.js CDN -->
+  <!-- Chart.js CDN -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <!-- Historical Export Libraries: SheetJS (Excel) & jsPDF + autotable (PDF) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
   <link rel="stylesheet" href="stylle.css">
 </head>
 <body>
@@ -33,33 +36,6 @@
         <span class="status-dot offline"></span>
         <span class="status-text" id="statusText">Disconnected</span>
       </div>
-
-      <!-- Mode Selector: MQTT Cloud vs Direct WS -->
-      <div class="ip-input-group">
-        <i class="fa-solid fa-tower-broadcast" title="Connection Mode"></i>
-        <select id="connMode" onchange="switchConnMode()">
-          <option value="hivemq" selected>Cloud HiveMQ (Recommended for Mobile)</option>
-          <option value="emqx">Cloud EMQX</option>
-          <option value="mosquitto">Cloud Mosquitto</option>
-          <option value="ws">Direct WebSocket (ESP32 IP)</option>
-        </select>
-      </div>
-
-      <div class="ip-input-group" id="mqttTopicGroup">
-        <i class="fa-solid fa-tag"></i>
-        <input type="text" id="mqttTopic" value="substation/telemetry/rej601_ems01" placeholder="MQTT Topic">
-        <button id="mqttConnectBtn" onclick="toggleMqttConnection()"><i class="fa-solid fa-cloud-arrow-down"></i> Connect Cloud</button>
-      </div>
-
-      <div class="ip-input-group hidden" id="wsIpGroup">
-        <i class="fa-solid fa-network-wired"></i>
-        <input type="text" id="wsIp" value="10.42.198.181" placeholder="ESP32 IP Address">
-        <button id="connectBtn" onclick="toggleConnection()"><i class="fa-solid fa-plug"></i> Connect WS</button>
-      </div>
-
-      <button class="sim-toggle-btn" id="simBtn" onclick="toggleSimulation()">
-        <i class="fa-solid fa-flask"></i> <span id="simText">Enable Demo Mode</span>
-      </button>
     </div>
   </header>
 
@@ -417,15 +393,18 @@
       </div>
     </section>
 
-    <!-- NEW SECTION: HISTORICAL FILTER & DATA EXPORT -->
+    <!-- HISTORICAL DATA MODULE (PostgreSQL via FastAPI /history) -->
     <section class="card span-full hist-card">
       <div class="card-header">
         <div class="card-title">
           <i class="fa-solid fa-clock-rotate-left header-icon"></i>
           <h2>Historical Data Logs & Export</h2>
         </div>
+        <span class="badge badge-meter">Source: PostgreSQL via FastAPI</span>
       </div>
+
       <div class="hist-controls-grid">
+        <!-- Search Filters -->
         <div class="date-range-inputs">
           <div class="input-item">
             <label for="histStart">Start Date & Time</label>
@@ -435,29 +414,51 @@
             <label for="histEnd">End Date & Time</label>
             <input type="datetime-local" id="histEnd">
           </div>
+          <div class="input-item">
+            <label for="histPanelId">Panel ID</label>
+            <input type="text" id="histPanelId" placeholder="e.g. PANEL-01"
+              style="background: rgba(0,0,0,0.3); border: 1px solid var(--bg-card-border); border-radius: 8px; color: #fff; padding: 8px 12px; font-family: var(--font-mono); font-size: 0.85rem; outline: none;">
+          </div>
         </div>
+
+        <!-- Export Options -->
         <div class="export-checkboxes">
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkVolt" checked> Voltages (V_R, V_Y, V_B)
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkCurr" checked> Currents (I1, I2, I3, I0)
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkFreq" checked> Frequency
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkPower" checked> Power & PF
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkEnv" checked> Temp & Humidity
-          </label>
+          <span style="font-size:0.8rem; font-weight:700; color: var(--text-muted); text-transform:uppercase; letter-spacing:0.5px;">Export Displayed Records</span>
+          <button class="action-btn download-btn" onclick="exportExcel()"><i class="fa-solid fa-file-excel"></i> Export Excel (.xlsx)</button>
+          <button class="action-btn download-btn" onclick="exportPDF()"><i class="fa-solid fa-file-pdf"></i> Export PDF (.pdf)</button>
         </div>
+
+        <!-- Actions -->
         <div class="hist-action-buttons">
-          <button class="action-btn filter-btn" onclick="filterHistoricalData()"><i class="fa-solid fa-filter"></i> Filter Graph</button>
+          <button class="action-btn filter-btn" onclick="fetchHistoricalData()"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
           <button class="action-btn reset-btn" id="resetLiveBtn" onclick="resetToLiveChart()" disabled><i class="fa-solid fa-play"></i> Show Live Chart</button>
-          <button class="action-btn download-btn" onclick="exportToCSV()"><i class="fa-solid fa-download"></i> Download CSV</button>
-          <button class="action-btn clear-btn" onclick="clearLocalDatabase()"><i class="fa-solid fa-trash-can"></i> Clear Database</button>
+          <button class="action-btn clear-btn" onclick="clearHistoricalData()" style="grid-column: 1 / -1;"><i class="fa-solid fa-trash-can"></i> Clear Data</button>
+        </div>
+      </div>
+
+      <!-- Historical Records Table -->
+      <div class="sub-panel" style="margin-top: 16px;">
+        <div class="panel-subtitle"><i class="fa-solid fa-table"></i> Historical Records</div>
+        <p id="historyMessage" style="color: var(--text-muted); font-size: 0.85rem; padding: 6px 0 10px;">Select a date range and click Search to view historical records.</p>
+        <div id="historyTableWrapper" class="hidden" style="overflow-x: auto;">
+          <table class="meter-table" id="historyTable">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Time</th>
+                <th>Panel ID</th>
+                <th>Relay Status</th>
+                <th>Voltage</th>
+                <th>Current</th>
+                <th>Frequency</th>
+                <th>Temperature</th>
+                <th>Humidity</th>
+                <th>Fault Status</th>
+              </tr>
+            </thead>
+            <tbody id="historyTableBody">
+            </tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -483,7 +484,7 @@
   </main>
 
   <footer class="app-footer">
-    <p>Substation Automation & Protection Monitoring System • ABB REJ601 & EMS-01 Modbus RTU Interface • MQTT Cloud (broker.hivemq.com)</p>
+    <p>Substation Automation & Protection Monitoring System • ABB REJ601 & EMS-01 Modbus RTU Interface • FastAPI + PostgreSQL Backend</p>
   </footer>
 
   <script src="app.js"></script>

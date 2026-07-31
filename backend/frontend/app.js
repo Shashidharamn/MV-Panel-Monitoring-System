@@ -1,25 +1,38 @@
 /* ==========================================================================
-   Substation Live Dashboard - Real-time Application Logic (MQTT & Historical Logs)
+   Substation Live Dashboard - Real-time Application Logic
+   Architecture: ESP32 -> FastAPI -> PostgreSQL -> Dashboard
+   Live data source: FastAPI GET /latest (polled every 2s)
+   Historical data source: FastAPI GET /history and DELETE /history
    ========================================================================== */
 
-let ws = null;
-let mqttClient = null;
-let isSimulating = false;
-let simInterval = null;
+// ==========================================================================
+// Backend API Configuration
+// (Later this base URL will change to the deployed Render URL - nothing else
+//  in this file needs to change when that happens)
+// ==========================================================================
+const API_BASE_URL = "http://127.0.0.1:8000";
+const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
+const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
+const POLL_INTERVAL_MS = 2000;
+
+let pollIntervalHandle = null;
+
 let chartInstance = null;
 let activeChartMode = 'currents'; // 'currents' | 'voltages' | 'environment'
-let currentMode = 'mqtt'; // 'mqtt' | 'ws'
 
 // State for live vs historical charting
 let isShowingHistorical = false;
-let historicalDataRecords = [];
+
+// Holds only the records currently displayed in the historical table,
+// used as the source for Excel/PDF export ("export only what's displayed")
+let currentHistoricalRecords = [];
 
 // Helper function to check for null, undefined, or NaN safely
 function isInvalid(val) {
   return val === null || val === undefined || isNaN(Number(val));
 }
 
-// Historical chart telemetry buffer (last 20 samples for live view)
+// Live chart telemetry buffer (last 20 samples)
 const chartDataBuffer = {
   timestamps: [],
   i1: [], i2: [], i3: [], i0: [],
@@ -28,7 +41,9 @@ const chartDataBuffer = {
 };
 
 // ==========================================================================
-// IndexedDB Setup for local browser storage (gigabyte-capacity offline logs)
+// IndexedDB Setup - retained ONLY for temporary browser caching of live
+// telemetry. It is no longer used as the source for historical records;
+// all historical queries go through FastAPI -> PostgreSQL (GET/DELETE /history).
 // ==========================================================================
 const dbName = "SubstationTelemetryDB";
 const storeName = "telemetry";
@@ -45,7 +60,7 @@ function initDB() {
     };
     request.onsuccess = (e) => {
       db = e.target.result;
-      console.log("IndexedDB initialized successfully.");
+      console.log("IndexedDB initialized successfully (temporary local cache).");
       resolve(db);
     };
     request.onerror = (e) => {
@@ -59,7 +74,7 @@ function saveTelemetryToDB(data) {
   if (!db) return;
   const transaction = db.transaction([storeName], "readwrite");
   const store = transaction.objectStore(storeName);
-  
+
   const record = {
     timestamp: new Date().toISOString(),
     i1: isInvalid(data.relay?.i1) ? null : Number(data.relay.i1),
@@ -75,7 +90,7 @@ function saveTelemetryToDB(data) {
     pf_t: isInvalid(data.meter?.pf_t) ? null : Number(data.meter.pf_t),
     p_t: isInvalid(data.meter?.p_t) ? null : Number(data.meter.p_t),
   };
-  
+
   store.put(record);
 }
 
@@ -84,165 +99,20 @@ document.addEventListener('DOMContentLoaded', () => {
   initChart();
   updateTimestamp();
 
-  // Initialize DB and then auto connect
+  // Initialize local cache DB, then start polling FastAPI for live telemetry
   initDB().then(() => {
-    toggleMqttConnection();
+    startLivePolling();
+  }).catch(() => {
+    // Even if IndexedDB fails, live polling should still work
+    startLivePolling();
   });
 });
-
-// Switch connection mode UI controls
-function switchConnMode() {
-  const mode = document.getElementById('connMode').value;
-  currentMode = mode;
-  const mqttGroup = document.getElementById('mqttTopicGroup');
-  const wsGroup = document.getElementById('wsIpGroup');
-
-  if (mode === 'ws') {
-    mqttGroup.classList.add('hidden');
-    wsGroup.classList.remove('hidden');
-  } else {
-    mqttGroup.classList.remove('hidden');
-    wsGroup.classList.add('hidden');
-    toggleMqttConnection();
-  }
-}
 
 // Update top header timestamp
 function updateTimestamp() {
   const now = new Date();
   const timeStr = now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
   document.getElementById('lastUpdated').innerText = timeStr;
-}
-
-/* ==========================================================================
-   MQTT Cloud Connection Handling (HiveMQ / EMQX / Mosquitto via WebSockets)
-   ========================================================================== */
-function toggleMqttConnection() {
-  if (isSimulating) {
-    toggleSimulation(false);
-  }
-
-  if (mqttClient && mqttClient.connected) {
-    mqttClient.end();
-    setConnectionState('offline', 'Cloud Disconnected');
-    document.getElementById('mqttConnectBtn').innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Connect Cloud';
-    return;
-  }
-
-  const topic = document.getElementById('mqttTopic').value.trim() || 'substation/telemetry/rej601_ems01';
-  const mode = document.getElementById('connMode').value;
-
-  let brokerUrl = 'wss://broker.hivemq.com:8884/mqtt'; // Default ultra-fast mobile broker
-  if (mode === 'emqx') {
-    brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
-  } else if (mode === 'mosquitto') {
-    brokerUrl = 'wss://test.mosquitto.org:8081/mqtt';
-  }
-
-  setConnectionState('offline', 'Connecting Cloud MQTT...');
-  document.getElementById('mqttConnectBtn').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Connecting...';
-
-  try {
-    mqttClient = mqtt.connect(brokerUrl, {
-      clientId: 'dashboard_mobile_' + Math.random().toString(16).substring(2, 10),
-      clean: true,
-      connectTimeout: 10000,
-      reconnectPeriod: 3000
-    });
-
-    mqttClient.on('connect', () => {
-      setConnectionState('online', `Cloud Connected (${topic})`);
-      document.getElementById('mqttConnectBtn').innerHTML = '<i class="fa-solid fa-cloud-xmark"></i> Disconnect';
-
-      mqttClient.subscribe(topic, { qos: 0 }, (err) => {
-        if (err) console.error('Subscription error:', err);
-        else console.log('Subscribed successfully to topic:', topic);
-      });
-    });
-
-    mqttClient.on('message', (receivedTopic, message) => {
-      try {
-        const payload = JSON.parse(message.toString());
-        processTelemetryData(payload);
-      } catch (err) {
-        console.error('Error parsing MQTT JSON payload:', err);
-      }
-    });
-
-    mqttClient.on('error', (err) => {
-      console.error('MQTT Error:', err);
-      setConnectionState('offline', 'Cloud Error');
-    });
-
-    mqttClient.on('close', () => {
-      setConnectionState('offline', 'Cloud Disconnected');
-      document.getElementById('mqttConnectBtn').innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Connect Cloud';
-    });
-
-  } catch (ex) {
-    console.error('Failed to create MQTT client:', ex);
-    setConnectionState('offline', 'MQTT Failed');
-    document.getElementById('mqttConnectBtn').innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> Connect Cloud';
-  }
-}
-
-/* ==========================================================================
-   Direct WebSocket Connection Handling
-   ========================================================================== */
-function toggleConnection() {
-  if (isSimulating) {
-    toggleSimulation(false);
-  }
-
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    ws.close();
-    setConnectionState('offline', 'Disconnected');
-    document.getElementById('connectBtn').innerHTML = '<i class="fa-solid fa-plug"></i> Connect WS';
-    return;
-  }
-
-  const ip = document.getElementById('wsIp').value.trim();
-  if (!ip) {
-    alert('Please enter a valid ESP32 IP address.');
-    return;
-  }
-
-  const wsUrl = `ws://${ip}/ws`;
-  setConnectionState('offline', 'Connecting WS...');
-  document.getElementById('connectBtn').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Connecting';
-
-  try {
-    ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-      setConnectionState('online', `Connected WS (${ip})`);
-      document.getElementById('connectBtn').innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Disconnect';
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        processTelemetryData(payload);
-      } catch (err) {
-        console.error('Error parsing JSON from WebSocket:', err);
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error('WebSocket Error:', error);
-      setConnectionState('offline', 'WS Error');
-    };
-
-    ws.onclose = () => {
-      setConnectionState('offline', 'Disconnected');
-      document.getElementById('connectBtn').innerHTML = '<i class="fa-solid fa-plug"></i> Connect WS';
-    };
-
-  } catch (ex) {
-    console.error('Failed to create WebSocket:', ex);
-    setConnectionState('offline', 'Connection Failed');
-    document.getElementById('connectBtn').innerHTML = '<i class="fa-solid fa-plug"></i> Connect WS';
-  }
 }
 
 function setConnectionState(state, text) {
@@ -253,94 +123,40 @@ function setConnectionState(state, text) {
 }
 
 /* ==========================================================================
-   Simulation Mode (Offline Preview)
+   LIVE MONITORING - FastAPI Data Fetching (Database -> FastAPI -> Dashboard)
+   Do NOT modify this section's behavior.
    ========================================================================== */
-function toggleSimulation(forceState) {
-  if (forceState !== undefined) {
-    isSimulating = !forceState;
-  }
+function startLivePolling() {
+  setConnectionState('offline', 'Connecting to FastAPI...');
 
-  if (!isSimulating) {
-    if (ws) ws.close();
-    if (mqttClient) mqttClient.end();
-    isSimulating = true;
-    document.getElementById('simText').innerText = 'Disable Demo Mode';
-    document.getElementById('simBtn').style.background = 'linear-gradient(135deg, #10b981, #047857)';
-    setConnectionState('simulating', 'Demo Mode (Simulated Data)');
-    
-    generateSimulatedData();
-    simInterval = setInterval(generateSimulatedData, 3000);
-  } else {
-    isSimulating = false;
-    clearInterval(simInterval);
-    document.getElementById('simText').innerText = 'Enable Demo Mode';
-    document.getElementById('simBtn').style.background = 'linear-gradient(135deg, #d97706, #b45309)';
-    setConnectionState('offline', 'Disconnected');
-  }
+  // Fetch immediately, then poll on an interval
+  fetchLatestData();
+
+  if (pollIntervalHandle) clearInterval(pollIntervalHandle);
+  pollIntervalHandle = setInterval(fetchLatestData, POLL_INTERVAL_MS);
 }
 
-function generateSimulatedData() {
-  const baseI = 15.0 + (Math.random() * 4.0 - 2.0);
-  const baseV = 230.0 + (Math.random() * 6.0 - 3.0);
+async function fetchLatestData() {
+  try {
+    const response = await fetch(LATEST_ENDPOINT);
 
-  const mockPayload = {
-    relay: {
-      sg_active: 1,
-      pickup_phase: 30.0,
-      pickup_earth: 15.0,
-      op_counter: 14,
-      i1: +(baseI + (Math.random() * 0.8)).toFixed(2),
-      i2: +(baseI + (Math.random() * 0.8)).toFixed(2),
-      i3: +(baseI + (Math.random() * 0.8)).toFixed(2),
-      i0: +(Math.random() * 0.4).toFixed(2),
-      neg_seq: +(Math.random() * 0.5).toFixed(2),
-      thermal_level: Math.floor(25 + Math.random() * 10),
-      rtc: `${new Date().getDate().toString().padStart(2,'0')}/${(new Date().getMonth()+1).toString().padStart(2,'0')}/2026 ${new Date().toLocaleTimeString()}.000`,
-      live_fault_status: Math.random() < 0.05 ? "Fault Detected - O/C (Overcurrent Phase-to-Phase)" : "No Fault Detected",
-      event: {
-        type: 3,
-        subtype: 12,
-        timestamp: "25/07/26 14:30:15.120"
-      },
-      fault_record1: {
-        pre_start: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A",
-        at_start: "I1=28.50A I2=29.10A I3=28.80A I0=0.20A",
-        at_start_time: "25/07/26 14:28:10.050",
-        at_trip: "I1=35.20A I2=34.90A I3=36.10A I0=0.40A",
-        at_trip_time: "25/07/26 14:28:10.150",
-        p80: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A",
-        p200: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A",
-        at_trip_status: "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
-      }
-    },
-    meter: {
-      v_r: +(baseV + (Math.random() * 2)).toFixed(1),
-      v_y: +(baseV + (Math.random() * 2)).toFixed(1),
-      v_b: +(baseV + (Math.random() * 2)).toFixed(1),
-      i_r: +(baseI + (Math.random() * 0.5)).toFixed(2),
-      i_y: +(baseI + (Math.random() * 0.5)).toFixed(2),
-      i_b: +(baseI + (Math.random() * 0.5)).toFixed(2),
-      frequency: +(50.0 + (Math.random() * 0.1 - 0.05)).toFixed(2),
-      pf_r: 0.98,
-      pf_y: 0.97,
-      pf_b: 0.98,
-      pf_t: 0.98,
-      p_r: 3.45,
-      p_y: 3.42,
-      p_b: 3.48,
-      p_t: 10.35
-    },
-    dht: {
-      temperature: +(28.5 + (Math.random() * 3.0)).toFixed(1),
-      humidity: +(62.0 + (Math.random() * 5.0)).toFixed(1)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
-  };
 
-  processTelemetryData(mockPayload);
+    const data = await response.json();
+
+    setConnectionState('online', 'Connected (FastAPI)');
+    processTelemetryData(data);
+
+  } catch (err) {
+    console.error('Error fetching latest telemetry from FastAPI:', err);
+    setConnectionState('offline', 'FastAPI Disconnected');
+  }
 }
 
 /* ==========================================================================
-   Telemetry Processing & UI Updates
+   Telemetry Processing & UI Updates (Live Monitoring - unchanged)
    ========================================================================== */
 function processTelemetryData(data) {
   updateTimestamp();
@@ -349,7 +165,7 @@ function processTelemetryData(data) {
   const meter = data.meter || {};
   const dht = data.dht || {};
 
-  // Store in Local IndexedDB logs
+  // Cache in Local IndexedDB (temporary browser cache only)
   saveTelemetryToDB(data);
 
   // 1. RELAY SECTION
@@ -376,13 +192,13 @@ function processTelemetryData(data) {
   updatePhaseAlarm('pillI3', i3, pickupIphase);
   updatePhaseAlarm('pillI0', i0, pickupIearth);
 
-  // Display C++ State Machine Live Fault Status
+  // Display Live Fault Status
   const liveFault = relay.live_fault_status || "No Fault Detected";
   const banner = document.getElementById('faultSummaryBanner');
   const icon = document.getElementById('faultIcon');
   const text = document.getElementById('faultSummaryText');
   text.innerText = liveFault;
-  
+
   if (liveFault.includes("Fault Detected")) {
     banner.className = 'fault-summary-banner faulted';
     icon.className = 'fa-solid fa-triangle-exclamation';
@@ -482,7 +298,7 @@ function processTelemetryData(data) {
   document.getElementById('sumTemp').innerText = isInvalid(temp) ? '--' : Number(temp).toFixed(1);
   document.getElementById('sumHum').innerText = isInvalid(hum) ? '--' : Number(hum).toFixed(1);
 
-  // 5. UPDATE CHART TELEMETRY BUFFER (only if live chart is active)
+  // 5. UPDATE LIVE CHART TELEMETRY BUFFER (only if live chart is active)
   if (!isShowingHistorical) {
     pushChartBuffer(i1, i2, i3, i0, meter.v_r, meter.v_y, meter.v_b, temp, hum);
   }
@@ -529,11 +345,11 @@ function removeAlertBanner(id) {
 }
 
 /* ==========================================================================
-   Chart.js Real-time / Historical Trend Graphs
+   Chart.js Real-time / Historical Trend Graph (shared canvas)
    ========================================================================== */
 function initChart() {
   const ctx = document.getElementById('telemetryChart').getContext('2d');
-  
+
   chartInstance = new Chart(ctx, {
     type: 'line',
     data: {
@@ -569,9 +385,9 @@ function switchChartMode(mode) {
   activeChartMode = mode;
   document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
   event.target.classList.add('active');
-  
+
   if (isShowingHistorical) {
-    plotHistoricalChart();
+    updateHistoricalChart(currentHistoricalRecords);
   } else {
     updateChartDatasets();
   }
@@ -639,79 +455,178 @@ function pushChartBuffer(i1, i2, i3, i0, vr, vy, vb, temp, hum) {
   }
 }
 
-// ==========================================================================
-// Historical Querying, Filtering and Chart Plotting
-// ==========================================================================
-function filterHistoricalData() {
-  const startVal = document.getElementById('histStart').value;
-  const endVal = document.getElementById('histEnd').value;
+/* ==========================================================================
+   HISTORICAL DATA MODULE
+   Source of truth: PostgreSQL, accessed exclusively through FastAPI
+   GET  /history  -> search/filter records
+   DELETE /history -> remove records matching the selected filters
+   ========================================================================== */
 
-  if (!startVal || !endVal) {
-    alert("Please select both Start and End date/time range.");
-    return;
-  }
-
-  const startDate = new Date(startVal).toISOString();
-  const endDate = new Date(endVal).toISOString();
-
-  if (new Date(startDate) > new Date(endDate)) {
-    alert("Start range cannot be after End range.");
-    return;
-  }
-
-  if (!db) {
-    alert("Database not ready yet.");
-    return;
-  }
-
-  const transaction = db.transaction([storeName], "readonly");
-  const store = transaction.objectStore(storeName);
-  const records = [];
-
-  const keyRange = IDBKeyRange.bound(startDate, endDate);
-  const cursorRequest = store.openCursor(keyRange);
-
-  cursorRequest.onsuccess = (e) => {
-    const cursor = e.target.result;
-    if (cursor) {
-      records.push(cursor.value);
-      cursor.continue();
-    } else {
-      // Finished scanning
-      if (records.length === 0) {
-        alert("No logs found in this date/time range.");
-        return;
-      }
-      historicalDataRecords = records;
-      isShowingHistorical = true;
-      document.getElementById('resetLiveBtn').disabled = false;
-      plotHistoricalChart();
-    }
-  };
+// Small numeric helpers used by table rendering, chart plotting and export
+function numOrNull(v) {
+  return isInvalid(v) ? null : Number(v);
 }
 
-function plotHistoricalChart() {
-  if (!chartInstance || historicalDataRecords.length === 0) return;
+function avgOf(a, b, c) {
+  const vals = [a, b, c].filter(v => !isInvalid(v)).map(Number);
+  if (vals.length === 0) return '--';
+  return (vals.reduce((sum, v) => sum + v, 0) / vals.length).toFixed(1);
+}
 
-  const timestamps = historicalDataRecords.map(r => new Date(r.timestamp).toLocaleTimeString() + ' ' + new Date(r.timestamp).toLocaleDateString());
+function showHistoryMessage(msg) {
+  const msgEl = document.getElementById('historyMessage');
+  const tableWrapper = document.getElementById('historyTableWrapper');
+  if (msgEl) {
+    msgEl.innerText = msg;
+    msgEl.classList.remove('hidden');
+  }
+  if (tableWrapper) tableWrapper.classList.add('hidden');
+}
+
+function hideHistoryMessage() {
+  const msgEl = document.getElementById('historyMessage');
+  const tableWrapper = document.getElementById('historyTableWrapper');
+  if (msgEl) msgEl.classList.add('hidden');
+  if (tableWrapper) tableWrapper.classList.remove('hidden');
+}
+
+// Reads the current filter inputs (Start Date, End Date, Panel ID)
+function getHistoryFilters() {
+  const startDate = document.getElementById('histStart').value;
+  const endDate = document.getElementById('histEnd').value;
+  const panelId = document.getElementById('histPanelId').value.trim();
+  return { startDate, endDate, panelId };
+}
+
+// GET /history?start_date=...&end_date=...&panel_id=...
+async function fetchHistoricalData() {
+  const { startDate, endDate, panelId } = getHistoryFilters();
+
+  if (!startDate || !endDate) {
+    alert('Please select both Start Date and End Date.');
+    return;
+  }
+
+  if (new Date(startDate) > new Date(endDate)) {
+    alert('Start date/time cannot be after End date/time.');
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set('start_date', startDate);
+  params.set('end_date', endDate);
+  if (panelId) params.set('panel_id', panelId);
+
+  showHistoryMessage('Loading historical records...');
+
+  try {
+    const response = await fetch(`${HISTORY_ENDPOINT}?${params.toString()}`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const records = await response.json();
+
+    if (!Array.isArray(records) || records.length === 0) {
+      currentHistoricalRecords = [];
+      renderHistoricalTable([]);
+      showHistoryMessage('No historical records found.');
+      return;
+    }
+
+    currentHistoricalRecords = records;
+    isShowingHistorical = true;
+    document.getElementById('resetLiveBtn').disabled = false;
+
+    hideHistoryMessage();
+    renderHistoricalTable(records);
+    updateHistoricalChart(records);
+
+  } catch (err) {
+    console.error('Error fetching historical data from FastAPI:', err);
+    currentHistoricalRecords = [];
+    showHistoryMessage('Unable to load historical records. Please try again.');
+  }
+}
+
+// Renders the Historical Records table using the fields returned by /history
+function renderHistoricalTable(records) {
+  const tbody = document.getElementById('historyTableBody');
+  if (!tbody) return;
+
+  tbody.innerHTML = '';
+
+  if (!records || records.length === 0) {
+    return;
+  }
+
+  records.forEach(r => {
+    const row = document.createElement('tr');
+
+    const dt = r.timestamp ? new Date(r.timestamp) : null;
+    const validDt = dt && !isNaN(dt.getTime());
+    const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '--');
+    const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '--') : '--');
+
+    const relayStatus = r.current_relay_status ?? '--';
+    const voltage = avgOf(r.meter_v_r, r.meter_v_y, r.meter_v_b);
+    const current = avgOf(r.meter_i_r, r.meter_i_y, r.meter_i_b);
+    const frequency = isInvalid(r.meter_frequency) ? '--' : Number(r.meter_frequency).toFixed(2);
+    const temperature = isInvalid(r.temperature) ? '--' : Number(r.temperature).toFixed(1);
+    const humidity = isInvalid(r.humidity) ? '--' : Number(r.humidity).toFixed(1);
+    const faultStatus = r.live_fault_status || r.fault_status || '--';
+
+    row.innerHTML = `
+      <td>${dateStr}</td>
+      <td>${timeStr}</td>
+      <td>${r.panel_id ?? '--'}</td>
+      <td>${relayStatus}</td>
+      <td>${voltage} V</td>
+      <td>${current} A</td>
+      <td>${frequency} Hz</td>
+      <td>${temperature} °C</td>
+      <td>${humidity} %</td>
+      <td>${faultStatus}</td>
+    `;
+
+    tbody.appendChild(row);
+  });
+}
+
+// Plots the shared telemetry chart using historical records from /history
+function updateHistoricalChart(records) {
+  if (!chartInstance) return;
+
+  if (!records || records.length === 0) {
+    chartInstance.data.labels = [];
+    chartInstance.data.datasets = [];
+    chartInstance.update();
+    return;
+  }
+
+  const timestamps = records.map(r => {
+    const dt = new Date(r.timestamp);
+    return !isNaN(dt.getTime()) ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : String(r.timestamp);
+  });
 
   if (activeChartMode === 'currents') {
     chartInstance.data.datasets = [
-      { label: 'Relay I1 (A)', data: historicalDataRecords.map(r => r.i1), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I2 (A)', data: historicalDataRecords.map(r => r.i2), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I3 (A)', data: historicalDataRecords.map(r => r.i3), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I0 Earth (A)', data: historicalDataRecords.map(r => r.i0), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
+      { label: 'Relay I1 (A)', data: records.map(r => numOrNull(r.relay_i1)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I2 (A)', data: records.map(r => numOrNull(r.relay_i2)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I3 (A)', data: records.map(r => numOrNull(r.relay_i3)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I0 Earth (A)', data: records.map(r => numOrNull(r.relay_i0)), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
     ];
   } else if (activeChartMode === 'voltages') {
     chartInstance.data.datasets = [
-      { label: 'Meter V_R (V)', data: historicalDataRecords.map(r => r.vr), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_Y (V)', data: historicalDataRecords.map(r => r.vy), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_B (V)', data: historicalDataRecords.map(r => r.vb), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 }
+      { label: 'Meter V_R (V)', data: records.map(r => numOrNull(r.meter_v_r)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
+      { label: 'Meter V_Y (V)', data: records.map(r => numOrNull(r.meter_v_y)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
+      { label: 'Meter V_B (V)', data: records.map(r => numOrNull(r.meter_v_b)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 }
     ];
   } else if (activeChartMode === 'environment') {
     chartInstance.data.datasets = [
-      { label: 'Temp (°C)', data: historicalDataRecords.map(r => r.temp), borderColor: '#f97316', tension: 0.3, borderWidth: 2 },
-      { label: 'Humidity (%)', data: historicalDataRecords.map(r => r.hum), borderColor: '#06b6d4', tension: 0.3, borderWidth: 2 }
+      { label: 'Temp (°C)', data: records.map(r => numOrNull(r.temperature)), borderColor: '#f97316', tension: 0.3, borderWidth: 2 },
+      { label: 'Humidity (%)', data: records.map(r => numOrNull(r.humidity)), borderColor: '#06b6d4', tension: 0.3, borderWidth: 2 }
     ];
   }
 
@@ -719,101 +634,116 @@ function plotHistoricalChart() {
   chartInstance.update();
 }
 
+// "Show Live Chart" - return to live /latest polling on the shared chart
 function resetToLiveChart() {
   isShowingHistorical = false;
   document.getElementById('resetLiveBtn').disabled = true;
   updateChartDatasets();
 }
 
-// ==========================================================================
-// Custom Columns Export to CSV
-// ==========================================================================
-function exportToCSV() {
-  const startVal = document.getElementById('histStart').value;
-  const endVal = document.getElementById('histEnd').value;
+// Builds a flat, export-friendly row shape shared by Excel & PDF export
+function buildExportRows(records) {
+  return records.map(r => {
+    const dt = r.timestamp ? new Date(r.timestamp) : null;
+    const validDt = dt && !isNaN(dt.getTime());
+    const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
+    const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
 
-  if (!startVal || !endVal) {
-    alert("Please select Start and End date/time range to export.");
+    return {
+      Date: dateStr,
+      Time: timeStr,
+      'Panel ID': r.panel_id ?? '',
+      'Relay Status': r.current_relay_status ?? '',
+      'Voltage (V)': avgOf(r.meter_v_r, r.meter_v_y, r.meter_v_b),
+      'Current (A)': avgOf(r.meter_i_r, r.meter_i_y, r.meter_i_b),
+      'Frequency (Hz)': isInvalid(r.meter_frequency) ? '' : Number(r.meter_frequency).toFixed(2),
+      'Temperature (C)': isInvalid(r.temperature) ? '' : Number(r.temperature).toFixed(1),
+      'Humidity (%)': isInvalid(r.humidity) ? '' : Number(r.humidity).toFixed(1),
+      'Fault Status': r.live_fault_status || r.fault_status || ''
+    };
+  });
+}
+
+// Export currently displayed records to an Excel (.xlsx) file
+function exportExcel() {
+  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
+    alert('No historical records to export. Please search first.');
     return;
   }
 
-  const startDate = new Date(startVal).toISOString();
-  const endDate = new Date(endVal).toISOString();
-
-  const transaction = db.transaction([storeName], "readonly");
-  const store = transaction.objectStore(storeName);
-  const records = [];
-
-  const keyRange = IDBKeyRange.bound(startDate, endDate);
-  const cursorRequest = store.openCursor(keyRange);
-
-  cursorRequest.onsuccess = (e) => {
-    const cursor = e.target.result;
-    if (cursor) {
-      records.push(cursor.value);
-      cursor.continue();
-    } else {
-      if (records.length === 0) {
-        alert("No telemetry records found to export.");
-        return;
-      }
-      generateCSVDownload(records);
-    }
-  };
+  const rows = buildExportRows(currentHistoricalRecords);
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Historical Data');
+  XLSX.writeFile(workbook, `historical_data_${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
 
-function generateCSVDownload(records) {
-  const chkVolt = document.getElementById('chkVolt').checked;
-  const chkCurr = document.getElementById('chkCurr').checked;
-  const chkFreq = document.getElementById('chkFreq').checked;
-  const chkPower = document.getElementById('chkPower').checked;
-  const chkEnv = document.getElementById('chkEnv').checked;
+// Export currently displayed records to a PDF file
+function exportPDF() {
+  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
+    alert('No historical records to export. Please search first.');
+    return;
+  }
 
-  const header = ["Timestamp"];
-  if (chkVolt) header.push("V_R (V)", "V_Y (V)", "V_B (V)");
-  if (chkCurr) header.push("I1 (A)", "I2 (A)", "I3 (A)", "I0 (A)");
-  if (chkFreq) header.push("Frequency (Hz)");
-  if (chkPower) header.push("PF_T", "P_T (kW)");
-  if (chkEnv) header.push("Temp (C)", "Humidity (%)");
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
 
-  let csvContent = header.join(",") + "\n";
+  doc.setFontSize(14);
+  doc.text('Historical Data Export - MV Panel Monitoring System', 14, 15);
 
-  records.forEach(r => {
-    const row = [new Date(r.timestamp).toLocaleString()];
-    if (chkVolt) row.push(r.vr ?? "", r.vy ?? "", r.vb ?? "");
-    if (chkCurr) row.push(r.i1 ?? "", r.i2 ?? "", r.i3 ?? "", r.i0 ?? "");
-    if (chkFreq) row.push(r.freq ?? "");
-    if (chkPower) row.push(r.pf_t ?? "", r.p_t ?? "");
-    if (chkEnv) row.push(r.temp ?? "", r.hum ?? "");
-    csvContent += row.join(",") + "\n";
+  const rows = buildExportRows(currentHistoricalRecords);
+  const head = [Object.keys(rows[0])];
+  const body = rows.map(r => Object.values(r));
+
+  doc.autoTable({
+    head,
+    body,
+    startY: 22,
+    styles: { fontSize: 7 },
+    headStyles: { fillColor: [6, 182, 212] }
   });
 
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.setAttribute("href", url);
-  link.setAttribute("download", `substation_export_${new Date().toISOString().slice(0,10)}.csv`);
-  link.style.visibility = 'hidden';
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+  doc.save(`historical_data_${new Date().toISOString().slice(0, 10)}.pdf`);
 }
 
-function clearLocalDatabase() {
-  if (!confirm("Are you sure you want to clear ALL historical database logs? This action is permanent!")) {
+// DELETE /history?start_date=...&end_date=...&panel_id=...
+async function clearHistoricalData() {
+  const { startDate, endDate, panelId } = getHistoryFilters();
+
+  if (!startDate || !endDate) {
+    alert('Please select Start Date and End Date before clearing data.');
     return;
   }
 
-  const transaction = db.transaction([storeName], "readwrite");
-  const store = transaction.objectStore(storeName);
-  const request = store.clear();
+  const confirmMsg = panelId
+    ? `Delete all historical records for Panel "${panelId}" between the selected dates? This action is permanent!`
+    : `Delete ALL historical records between the selected dates? This action is permanent!`;
 
-  request.onsuccess = () => {
-    alert("Database logs cleared successfully.");
-    historicalDataRecords = [];
-    resetToLiveChart();
-  };
-  request.onerror = (e) => {
-    alert("Error clearing database: " + e.target.error);
-  };
+  if (!confirm(confirmMsg)) {
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set('start_date', startDate);
+  params.set('end_date', endDate);
+  if (panelId) params.set('panel_id', panelId);
+
+  try {
+    const response = await fetch(`${HISTORY_ENDPOINT}?${params.toString()}`, {
+      method: 'DELETE'
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    alert('Historical records deleted successfully.');
+
+    // Refresh the table and graph with whatever remains for this filter
+    await fetchHistoricalData();
+
+  } catch (err) {
+    console.error('Error deleting historical data via FastAPI:', err);
+    alert('Error deleting historical records. Please try again.');
+  }
 }
