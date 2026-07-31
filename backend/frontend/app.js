@@ -1,25 +1,25 @@
 /* ==========================================================================
-   Substation Live Dashboard - Real-time Application Logic (MQTT Cloud Support)
+   Substation Live Dashboard - Real-time Application Logic (MQTT & Historical Logs)
    ========================================================================== */
 
 let ws = null;
 let mqttClient = null;
-
-const API_URL = "https://mv-panel-monitoring-system.onrender.com/latest";
-
 let isSimulating = false;
 let simInterval = null;
-
 let chartInstance = null;
 let activeChartMode = 'currents'; // 'currents' | 'voltages' | 'environment'
 let currentMode = 'mqtt'; // 'mqtt' | 'ws'
+
+// State for live vs historical charting
+let isShowingHistorical = false;
+let historicalDataRecords = [];
 
 // Helper function to check for null, undefined, or NaN safely
 function isInvalid(val) {
   return val === null || val === undefined || isNaN(Number(val));
 }
 
-// Historical chart telemetry buffer (last 20 samples)
+// Historical chart telemetry buffer (last 20 samples for live view)
 const chartDataBuffer = {
   timestamps: [],
   i1: [], i2: [], i3: [], i0: [],
@@ -27,18 +27,68 @@ const chartDataBuffer = {
   temp: [], hum: []
 };
 
+// ==========================================================================
+// IndexedDB Setup for local browser storage (gigabyte-capacity offline logs)
+// ==========================================================================
+const dbName = "SubstationTelemetryDB";
+const storeName = "telemetry";
+let db = null;
+
+function initDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(dbName, 1);
+    request.onupgradeneeded = (e) => {
+      const database = e.target.result;
+      if (!database.objectStoreNames.contains(storeName)) {
+        database.createObjectStore(storeName, { keyPath: "timestamp" });
+      }
+    };
+    request.onsuccess = (e) => {
+      db = e.target.result;
+      console.log("IndexedDB initialized successfully.");
+      resolve(db);
+    };
+    request.onerror = (e) => {
+      console.error("IndexedDB initialization error:", e.target.error);
+      reject(e.target.error);
+    };
+  });
+}
+
+function saveTelemetryToDB(data) {
+  if (!db) return;
+  const transaction = db.transaction([storeName], "readwrite");
+  const store = transaction.objectStore(storeName);
+  
+  const record = {
+    timestamp: new Date().toISOString(),
+    i1: isInvalid(data.relay?.i1) ? null : Number(data.relay.i1),
+    i2: isInvalid(data.relay?.i2) ? null : Number(data.relay.i2),
+    i3: isInvalid(data.relay?.i3) ? null : Number(data.relay.i3),
+    i0: isInvalid(data.relay?.i0) ? null : Number(data.relay.i0),
+    vr: isInvalid(data.meter?.v_r) ? null : Number(data.meter.v_r),
+    vy: isInvalid(data.meter?.v_y) ? null : Number(data.meter.v_y),
+    vb: isInvalid(data.meter?.v_b) ? null : Number(data.meter.v_b),
+    freq: isInvalid(data.meter?.frequency) ? null : Number(data.meter.frequency),
+    temp: isInvalid(data.dht?.temperature) ? null : Number(data.dht.temperature),
+    hum: isInvalid(data.dht?.humidity) ? null : Number(data.dht.humidity),
+    pf_t: isInvalid(data.meter?.pf_t) ? null : Number(data.meter.pf_t),
+    p_t: isInvalid(data.meter?.p_t) ? null : Number(data.meter.p_t),
+  };
+  
+  store.put(record);
+}
+
 // Initialize app when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
-    initChart();
-    updateTimestamp();
+  initChart();
+  updateTimestamp();
 
-    // Load data immediately
-    fetchLatestData();
-
-    // Refresh every 3 seconds
-    setInterval(fetchLatestData, 3000);
+  // Initialize DB and then auto connect
+  initDB().then(() => {
+    toggleMqttConnection();
+  });
 });
-
 
 // Switch connection mode UI controls
 function switchConnMode() {
@@ -218,7 +268,6 @@ function toggleSimulation(forceState) {
     document.getElementById('simBtn').style.background = 'linear-gradient(135deg, #10b981, #047857)';
     setConnectionState('simulating', 'Demo Mode (Simulated Data)');
     
-    // Generate simulated telemetry every 3 seconds (matching POLL_INTERVAL_MS)
     generateSimulatedData();
     simInterval = setInterval(generateSimulatedData, 3000);
   } else {
@@ -247,6 +296,7 @@ function generateSimulatedData() {
       neg_seq: +(Math.random() * 0.5).toFixed(2),
       thermal_level: Math.floor(25 + Math.random() * 10),
       rtc: `${new Date().getDate().toString().padStart(2,'0')}/${(new Date().getMonth()+1).toString().padStart(2,'0')}/2026 ${new Date().toLocaleTimeString()}.000`,
+      live_fault_status: Math.random() < 0.05 ? "Fault Detected - O/C (Overcurrent Phase-to-Phase)" : "No Fault Detected",
       event: {
         type: 3,
         subtype: 12,
@@ -259,7 +309,8 @@ function generateSimulatedData() {
         at_trip: "I1=35.20A I2=34.90A I3=36.10A I0=0.40A",
         at_trip_time: "25/07/26 14:28:10.150",
         p80: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A",
-        p200: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A"
+        p200: "I1=0.00A I2=0.00A I3=0.00A I0=0.00A",
+        at_trip_status: "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
       }
     },
     meter: {
@@ -285,10 +336,6 @@ function generateSimulatedData() {
     }
   };
 
-  if (Math.random() < 0.25) {
-    mockPayload.dht.temperature = 42.5; // > 40°C threshold
-  }
-
   processTelemetryData(mockPayload);
 }
 
@@ -301,6 +348,9 @@ function processTelemetryData(data) {
   const relay = data.relay || {};
   const meter = data.meter || {};
   const dht = data.dht || {};
+
+  // Store in Local IndexedDB logs
+  saveTelemetryToDB(data);
 
   // 1. RELAY SECTION
   if (relay.sg_active !== undefined) document.getElementById('relaySG').innerText = `SG${relay.sg_active}`;
@@ -320,14 +370,26 @@ function processTelemetryData(data) {
   document.getElementById('relayI3').innerText = isInvalid(i3) ? '--' : Number(i3).toFixed(2);
   document.getElementById('relayI0').innerText = isInvalid(i0) ? '--' : Number(i0).toFixed(2);
 
-  // Evaluate Phase Overcurrent & Earth Fault pills
-  updatePhasePill('pillI1', i1, pickupIphase);
-  updatePhasePill('pillI2', i2, pickupIphase);
-  updatePhasePill('pillI3', i3, pickupIphase);
-  updatePhasePill('pillI0', i0, pickupIearth);
+  // Evaluate Phase Overcurrent & Earth Fault alarms
+  updatePhaseAlarm('pillI1', i1, pickupIphase);
+  updatePhaseAlarm('pillI2', i2, pickupIphase);
+  updatePhaseAlarm('pillI3', i3, pickupIphase);
+  updatePhaseAlarm('pillI0', i0, pickupIearth);
 
-  // Evaluate Combined Fault Diagnosis Banner
-  evaluateFaultDiagnosis(i1, i2, i3, i0, pickupIphase, pickupIearth);
+  // Display C++ State Machine Live Fault Status
+  const liveFault = relay.live_fault_status || "No Fault Detected";
+  const banner = document.getElementById('faultSummaryBanner');
+  const icon = document.getElementById('faultIcon');
+  const text = document.getElementById('faultSummaryText');
+  text.innerText = liveFault;
+  
+  if (liveFault.includes("Fault Detected")) {
+    banner.className = 'fault-summary-banner faulted';
+    icon.className = 'fa-solid fa-triangle-exclamation';
+  } else {
+    banner.className = 'fault-summary-banner healthy';
+    icon.className = 'fa-solid fa-circle-check';
+  }
 
   document.getElementById('relayNegSeq').innerText = isInvalid(relay.neg_seq) ? '-- A' : `${Number(relay.neg_seq).toFixed(2)} A`;
   if (!isInvalid(relay.thermal_level)) {
@@ -353,6 +415,9 @@ function processTelemetryData(data) {
     if (fr.at_trip_time) document.getElementById('recAtTripTime').innerText = `@ ${fr.at_trip_time}`;
     if (fr.p80) document.getElementById('recP80').innerText = fr.p80;
     if (fr.p200) document.getElementById('recP200').innerText = fr.p200;
+    if (fr.at_trip_status) {
+      document.getElementById('recAtTripStatus').innerText = `Last trip classification: ${fr.at_trip_status}`;
+    }
   }
 
   // 2. METER SECTION
@@ -417,8 +482,10 @@ function processTelemetryData(data) {
   document.getElementById('sumTemp').innerText = isInvalid(temp) ? '--' : Number(temp).toFixed(1);
   document.getElementById('sumHum').innerText = isInvalid(hum) ? '--' : Number(hum).toFixed(1);
 
-  // 5. UPDATE CHART TELEMETRY BUFFER
-  pushChartBuffer(i1, i2, i3, i0, meter.v_r, meter.v_y, meter.v_b, temp, hum);
+  // 5. UPDATE CHART TELEMETRY BUFFER (only if live chart is active)
+  if (!isShowingHistorical) {
+    pushChartBuffer(i1, i2, i3, i0, meter.v_r, meter.v_y, meter.v_b, temp, hum);
+  }
 }
 
 // Helpers
@@ -431,7 +498,7 @@ function formatValRaw(val) {
   return Number(val).toFixed(2);
 }
 
-function updatePhasePill(elemId, val, threshold) {
+function updatePhaseAlarm(elemId, val, threshold) {
   const pill = document.getElementById(elemId);
   if (!pill) return;
   if (!isInvalid(val) && Number(val) > threshold) {
@@ -440,39 +507,6 @@ function updatePhasePill(elemId, val, threshold) {
   } else {
     pill.innerText = 'Normal';
     pill.className = 'fault-status-pill';
-  }
-}
-
-function evaluateFaultDiagnosis(i1, i2, i3, i0, pickupPhase, pickupEarth) {
-  const banner = document.getElementById('faultSummaryBanner');
-  const icon = document.getElementById('faultIcon');
-  const text = document.getElementById('faultSummaryText');
-
-  const p1 = !isInvalid(i1) && Number(i1) > pickupPhase;
-  const p2 = !isInvalid(i2) && Number(i2) > pickupPhase;
-  const p3 = !isInvalid(i3) && Number(i3) > pickupPhase;
-  const gnd = !isInvalid(i0) && Number(i0) > pickupEarth;
-  const phaseCount = (p1 ? 1 : 0) + (p2 ? 1 : 0) + (p3 ? 1 : 0);
-
-  const multiPhaseOC = (phaseCount >= 2);
-  const singlePhaseOCNoGround = (phaseCount === 1 && !gnd);
-
-  if (!multiPhaseOC && !singlePhaseOCNoGround && !gnd) {
-    banner.className = 'fault-summary-banner healthy';
-    icon.className = 'fa-solid fa-circle-check';
-    text.innerText = 'No Fault Detected (System Normal)';
-  } else {
-    banner.className = 'fault-summary-banner faulted';
-    icon.className = 'fa-solid fa-triangle-exclamation';
-
-    let faultDesc = 'Fault Detected: ';
-    const parts = [];
-    if (multiPhaseOC) parts.push('O/C (Phase-to-Phase Overcurrent)');
-    else if (singlePhaseOCNoGround) parts.push('O/C (Single-Phase Overcurrent)');
-
-    if (gnd) parts.push('E/F (Earth Fault Current)');
-
-    text.innerText = faultDesc + parts.join(' + ');
   }
 }
 
@@ -489,14 +523,13 @@ function triggerAlertBanner(id, text, alertClass) {
   }
 }
 
-// Remove alert banner helper
 function removeAlertBanner(id) {
   const banner = document.getElementById(id);
   if (banner) banner.remove();
 }
 
 /* ==========================================================================
-   Chart.js Real-time Trend Graphs
+   Chart.js Real-time / Historical Trend Graphs
    ========================================================================== */
 function initChart() {
   const ctx = document.getElementById('telemetryChart').getContext('2d');
@@ -536,7 +569,12 @@ function switchChartMode(mode) {
   activeChartMode = mode;
   document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
   event.target.classList.add('active');
-  updateChartDatasets();
+  
+  if (isShowingHistorical) {
+    plotHistoricalChart();
+  } else {
+    updateChartDatasets();
+  }
 }
 
 function updateChartDatasets() {
@@ -600,45 +638,182 @@ function pushChartBuffer(i1, i2, i3, i0, vr, vy, vb, temp, hum) {
     chartInstance.update('none');
   }
 }
-// ===============================
-// Fetch latest data from FastAPI
-// ===============================
-async function fetchLatestData() {
-    console.log("fetchLatestData called");
-    try {
-        const response = await fetch(API_URL);
 
-        if (!response.ok) {
-            throw new Error("Failed to fetch data");
-        }
+// ==========================================================================
+// Historical Querying, Filtering and Chart Plotting
+// ==========================================================================
+function filterHistoricalData() {
+  const startVal = document.getElementById('histStart').value;
+  const endVal = document.getElementById('histEnd').value;
 
-        const data = await response.json();
+  if (!startVal || !endVal) {
+    alert("Please select both Start and End date/time range.");
+    return;
+  }
 
-        console.log("Latest Data:", data);
+  const startDate = new Date(startVal).toISOString();
+  const endDate = new Date(endVal).toISOString();
 
-        processTelemetryData({
-            meter: {
-                v_r: data.vr,
-                v_y: data.vy,
-                v_b: data.vb,
-                i_r: data.ir,
-                i_y: data.iy,
-                i_b: data.ib,
-                frequency: data.frequency,
-                pf_r: data.pf_r,
-                pf_y: data.pf_y,
-                pf_b: data.pf_b,
-                pf_t: data.pf_total,
-                p_r: data.power_r,
-                p_y: data.power_y,
-                p_b: data.power_b,
-                p_t: data.power_total
-            },
-            relay: {},
-            dht: {}
-        });
+  if (new Date(startDate) > new Date(endDate)) {
+    alert("Start range cannot be after End range.");
+    return;
+  }
 
-    } catch (err) {
-        console.error("API Error:", err);
+  if (!db) {
+    alert("Database not ready yet.");
+    return;
+  }
+
+  const transaction = db.transaction([storeName], "readonly");
+  const store = transaction.objectStore(storeName);
+  const records = [];
+
+  const keyRange = IDBKeyRange.bound(startDate, endDate);
+  const cursorRequest = store.openCursor(keyRange);
+
+  cursorRequest.onsuccess = (e) => {
+    const cursor = e.target.result;
+    if (cursor) {
+      records.push(cursor.value);
+      cursor.continue();
+    } else {
+      // Finished scanning
+      if (records.length === 0) {
+        alert("No logs found in this date/time range.");
+        return;
+      }
+      historicalDataRecords = records;
+      isShowingHistorical = true;
+      document.getElementById('resetLiveBtn').disabled = false;
+      plotHistoricalChart();
     }
+  };
+}
+
+function plotHistoricalChart() {
+  if (!chartInstance || historicalDataRecords.length === 0) return;
+
+  const timestamps = historicalDataRecords.map(r => new Date(r.timestamp).toLocaleTimeString() + ' ' + new Date(r.timestamp).toLocaleDateString());
+
+  if (activeChartMode === 'currents') {
+    chartInstance.data.datasets = [
+      { label: 'Relay I1 (A)', data: historicalDataRecords.map(r => r.i1), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I2 (A)', data: historicalDataRecords.map(r => r.i2), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I3 (A)', data: historicalDataRecords.map(r => r.i3), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I0 Earth (A)', data: historicalDataRecords.map(r => r.i0), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
+    ];
+  } else if (activeChartMode === 'voltages') {
+    chartInstance.data.datasets = [
+      { label: 'Meter V_R (V)', data: historicalDataRecords.map(r => r.vr), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
+      { label: 'Meter V_Y (V)', data: historicalDataRecords.map(r => r.vy), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
+      { label: 'Meter V_B (V)', data: historicalDataRecords.map(r => r.vb), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 }
+    ];
+  } else if (activeChartMode === 'environment') {
+    chartInstance.data.datasets = [
+      { label: 'Temp (°C)', data: historicalDataRecords.map(r => r.temp), borderColor: '#f97316', tension: 0.3, borderWidth: 2 },
+      { label: 'Humidity (%)', data: historicalDataRecords.map(r => r.hum), borderColor: '#06b6d4', tension: 0.3, borderWidth: 2 }
+    ];
+  }
+
+  chartInstance.data.labels = timestamps;
+  chartInstance.update();
+}
+
+function resetToLiveChart() {
+  isShowingHistorical = false;
+  document.getElementById('resetLiveBtn').disabled = true;
+  updateChartDatasets();
+}
+
+// ==========================================================================
+// Custom Columns Export to CSV
+// ==========================================================================
+function exportToCSV() {
+  const startVal = document.getElementById('histStart').value;
+  const endVal = document.getElementById('histEnd').value;
+
+  if (!startVal || !endVal) {
+    alert("Please select Start and End date/time range to export.");
+    return;
+  }
+
+  const startDate = new Date(startVal).toISOString();
+  const endDate = new Date(endVal).toISOString();
+
+  const transaction = db.transaction([storeName], "readonly");
+  const store = transaction.objectStore(storeName);
+  const records = [];
+
+  const keyRange = IDBKeyRange.bound(startDate, endDate);
+  const cursorRequest = store.openCursor(keyRange);
+
+  cursorRequest.onsuccess = (e) => {
+    const cursor = e.target.result;
+    if (cursor) {
+      records.push(cursor.value);
+      cursor.continue();
+    } else {
+      if (records.length === 0) {
+        alert("No telemetry records found to export.");
+        return;
+      }
+      generateCSVDownload(records);
+    }
+  };
+}
+
+function generateCSVDownload(records) {
+  const chkVolt = document.getElementById('chkVolt').checked;
+  const chkCurr = document.getElementById('chkCurr').checked;
+  const chkFreq = document.getElementById('chkFreq').checked;
+  const chkPower = document.getElementById('chkPower').checked;
+  const chkEnv = document.getElementById('chkEnv').checked;
+
+  const header = ["Timestamp"];
+  if (chkVolt) header.push("V_R (V)", "V_Y (V)", "V_B (V)");
+  if (chkCurr) header.push("I1 (A)", "I2 (A)", "I3 (A)", "I0 (A)");
+  if (chkFreq) header.push("Frequency (Hz)");
+  if (chkPower) header.push("PF_T", "P_T (kW)");
+  if (chkEnv) header.push("Temp (C)", "Humidity (%)");
+
+  let csvContent = header.join(",") + "\n";
+
+  records.forEach(r => {
+    const row = [new Date(r.timestamp).toLocaleString()];
+    if (chkVolt) row.push(r.vr ?? "", r.vy ?? "", r.vb ?? "");
+    if (chkCurr) row.push(r.i1 ?? "", r.i2 ?? "", r.i3 ?? "", r.i0 ?? "");
+    if (chkFreq) row.push(r.freq ?? "");
+    if (chkPower) row.push(r.pf_t ?? "", r.p_t ?? "");
+    if (chkEnv) row.push(r.temp ?? "", r.hum ?? "");
+    csvContent += row.join(",") + "\n";
+  });
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute("download", `substation_export_${new Date().toISOString().slice(0,10)}.csv`);
+  link.style.visibility = 'hidden';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function clearLocalDatabase() {
+  if (!confirm("Are you sure you want to clear ALL historical database logs? This action is permanent!")) {
+    return;
+  }
+
+  const transaction = db.transaction([storeName], "readwrite");
+  const store = transaction.objectStore(storeName);
+  const request = store.clear();
+
+  request.onsuccess = () => {
+    alert("Database logs cleared successfully.");
+    historicalDataRecords = [];
+    resetToLiveChart();
+  };
+  request.onerror = (e) => {
+    alert("Error clearing database: " + e.target.error);
+  };
 }
