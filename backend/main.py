@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Optional, Tuple, List
 from db import get_connection
 
 app = FastAPI()
@@ -17,6 +18,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# -----------------------------
+# Global fallback exception handler
+# Ensures the API never leaks FastAPI/Starlette's default plain-text
+# "Internal Server Error" page. Any exception that isn't already an
+# HTTPException (i.e. wasn't handled/classified by an endpoint) is
+# converted into a clean JSON 500 response.
+# -----------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Unexpected server error: {str(exc)}"},
+    )
+
 
 # -----------------------------
 # Data Model
@@ -529,9 +546,6 @@ def row_to_dict(row, timestamp_as_string=False):
 # -----------------------------
 # Get Latest Sensor Data
 # -----------------------------
-# -----------------------------
-# Get Latest Sensor Data
-# -----------------------------
 @app.get("/latest")
 def latest_data():
 
@@ -624,12 +638,103 @@ LIMIT 1;
         },
     }
 
+
+# =============================================================================
+# HISTORICAL DATA MODULE HELPERS
+#
+# These two functions are shared by GET /history and DELETE /history so the
+# validation and WHERE-clause logic can never drift apart between the two
+# endpoints. Both raise HTTPException(400) directly on bad input, so callers
+# should invoke them *outside* any try/except that translates errors to 500 -
+# that's exactly how get_history/delete_history below are structured.
+# =============================================================================
+
+# Accepted input formats. HTML <input type="datetime-local"> sends
+# "YYYY-MM-DDTHH:MM" (no seconds, 'T' separator) - that's normalized to a
+# space before matching, so it's covered by the "%Y-%m-%d %H:%M" format.
+_DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+)
+
+
+def _parse_datetime(value: Optional[str], field_name: str) -> datetime:
+    """
+    Parses a date/time string into a datetime object.
+
+    Accepts:
+      - "YYYY-MM-DD"
+      - "YYYY-MM-DD HH:MM:SS"
+      - "YYYY-MM-DD HH:MM"
+      - "YYYY-MM-DDTHH:MM" / "YYYY-MM-DDTHH:MM:SS" (datetime-local input)
+
+    Raises HTTPException(400) with a clear, field-specific message on any
+    invalid or missing value. Never raises anything else, so it never
+    surfaces as a 500.
+    """
+    if value is None or not str(value).strip():
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+
+    cleaned = str(value).strip().replace("T", " ")
+
+    for fmt in _DATETIME_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Invalid {field_name} '{value}'. "
+            "Expected format 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'."
+        ),
+    )
+
+
+def build_history_filter(
+    start_date: str,
+    end_date: str,
+    panel_id: Optional[str],
+) -> Tuple[str, List]:
+    """
+    Validates start_date/end_date/panel_id and builds the shared SQL WHERE
+    clause + parameter list used by both GET /history and DELETE /history.
+
+    Uses `timestamp BETWEEN %s AND %s` (never DATE(timestamp)) so the
+    filter respects the exact time range requested, not just the day.
+    """
+    start_dt = _parse_datetime(start_date, "start_date")
+    end_dt = _parse_datetime(end_date, "end_date")
+
+    if start_dt > end_dt:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date cannot be later than end_date.",
+        )
+
+    where_clause = "timestamp BETWEEN %s AND %s"
+    params: List = [start_dt, end_dt]
+
+    if panel_id is not None and panel_id.strip():
+        where_clause += " AND panel_id = %s"
+        params.append(panel_id.strip())
+
+    return where_clause, params
+
+
+# -----------------------------
+# GET /history - search/filter historical records
+# -----------------------------
 @app.get("/history")
 def get_history(
     start_date: str = Query(..., alias="start_date"),
     end_date: str = Query(..., alias="end_date"),
-    panel_id: str = Query(None, alias="panel_id"),
+    panel_id: Optional[str] = Query(None, alias="panel_id"),
 ):
+    # Validation happens first and outside the DB try/except below, so any
+    # bad input surfaces as a clean 400 - it never gets wrapped as a 500.
     where_clause, params = build_history_filter(start_date, end_date, panel_id)
 
     conn = None
@@ -669,12 +774,18 @@ def get_history(
     return history
 
 
+# -----------------------------
+# DELETE /history - delete only records matching the given filters
+# -----------------------------
 @app.delete("/history")
 def delete_history(
     start_date: str = Query(..., alias="start_date"),
     end_date: str = Query(..., alias="end_date"),
-    panel_id: str = Query(None, alias="panel_id"),
+    panel_id: Optional[str] = Query(None, alias="panel_id"),
 ):
+    # Same shared validation as GET /history - guarantees DELETE can never
+    # run without a valid, bounded WHERE clause (i.e. can never wipe the
+    # whole table).
     where_clause, params = build_history_filter(start_date, end_date, panel_id)
 
     conn = None
@@ -717,7 +828,7 @@ def delete_history(
         )
 
     return {
-  "status": "success",
-  "number_of_deleted_rows": 25,
-  "message": "25 historical records deleted successfully."
-}
+        "status": "success",
+        "number_of_deleted_rows": deleted_count,
+        "message": f"{deleted_count} historical records deleted successfully."
+    }
