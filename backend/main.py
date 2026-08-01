@@ -529,6 +529,9 @@ def row_to_dict(row, timestamp_as_string=False):
 # -----------------------------
 # Get Latest Sensor Data
 # -----------------------------
+# -----------------------------
+# Get Latest Sensor Data
+# -----------------------------
 @app.get("/latest")
 def latest_data():
 
@@ -551,86 +554,75 @@ LIMIT 1;
     if row is None:
         return {"message": "No Data Available"}
 
-    return row_to_dict(row, timestamp_as_string=False)
+    flat = row_to_dict(row, timestamp_as_string=False)
 
+    def _phase_string(i1, i2, i3, i0):
+        return f"I1={i1} I2={i2} I3={i3} I0={i0}"
 
-# =====================================================================
-# HISTORICAL DATA BACKEND (GET /history + DELETE /history)
-#
-# Everything below this point is new/updated. Nothing above this
-# section has been changed.
-# =====================================================================
-
-def _parse_datetime(value: str, field_name: str) -> datetime:
-    """
-    Parses an incoming date/datetime string into a datetime object.
-    Accepts full timestamps ("YYYY-MM-DD HH:MM:SS" or ISO 8601 with "T")
-    as well as plain dates ("YYYY-MM-DD"), so that the filter works
-    correctly whether or not the frontend includes a time component.
-    """
-    if not value:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid date range: '{field_name}' is missing or empty."
-        )
-
-    candidate = value.strip().replace("T", " ")
-
-    formats = (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    )
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(candidate, fmt)
-        except ValueError:
-            continue
-
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"Invalid date range: '{field_name}' value '{value}' is not a "
-            f"recognized date/time format. Expected 'YYYY-MM-DD' or "
-            f"'YYYY-MM-DD HH:MM:SS'."
-        )
-    )
-
-
-def build_history_filter(start_date: str, end_date: str, panel_id: str = None):
-    """
-    Builds a parameterized WHERE clause + params list shared by both
-    GET /history and DELETE /history so the filtering logic never
-    drifts apart between the two endpoints.
-
-    Filters on the FULL timestamp (date + time), not DATE(timestamp),
-    so a time component in start_date / end_date is respected.
-    """
-    if not start_date or not end_date:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid date range: 'start_date' and 'end_date' are both required."
-        )
-
-    start_dt = _parse_datetime(start_date, "start_date")
-    end_dt = _parse_datetime(end_date, "end_date")
-
-    if start_dt > end_dt:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid date range: 'start_date' must not be later than 'end_date'."
-        )
-
-    where_clause = "timestamp BETWEEN %s AND %s"
-    params = [start_dt, end_dt]
-
-    if panel_id:
-        where_clause += " AND panel_id = %s"
-        params.append(panel_id)
-
-    return where_clause, params
-
+    return {
+        "relay": {
+            "sg_active": 1,
+            "pickup_phase": flat["pickup_phase"],
+            "pickup_earth": flat["pickup_earth"],
+            "i1": flat["relay_i1"],
+            "i2": flat["relay_i2"],
+            "i3": flat["relay_i3"],
+            "i0": flat["relay_i0"],
+            "op_counter": flat["operation_counter"],
+            "neg_seq": flat["negative_sequence_current"],
+            "thermal_level": flat["thermal_level"],
+            "rtc": flat["relay_rtc"],
+            "live_fault_status": flat["live_fault_status"],
+            "event": {
+                "type": flat["event_type"],
+                "subtype": flat["event_subtype"],
+                "timestamp": flat["event_timestamp"],
+            },
+            "fault_record1": {
+                "pre_start": _phase_string(
+                    flat["fr_prestart_i1"],
+                    flat["fr_prestart_i2"],
+                    flat["fr_prestart_i3"],
+                    flat["fr_prestart_i0"],
+                ),
+                "at_start": _phase_string(
+                    flat["fr_atstart_i1"],
+                    flat["fr_atstart_i2"],
+                    flat["fr_atstart_i3"],
+                    flat["fr_atstart_i0"],
+                ),
+                "at_start_time": flat["fr_atstart_timestamp"],
+                "at_trip": _phase_string(
+                    flat["fr_attrip_i1"],
+                    flat["fr_attrip_i2"],
+                    flat["fr_attrip_i3"],
+                    flat["fr_attrip_i0"],
+                ),
+                "at_trip_time": flat["fr_attrip_timestamp"],
+            },
+        },
+        "meter": {
+            "v_r": flat["meter_v_r"],
+            "v_y": flat["meter_v_y"],
+            "v_b": flat["meter_v_b"],
+            "i_r": flat["meter_i_r"],
+            "i_y": flat["meter_i_y"],
+            "i_b": flat["meter_i_b"],
+            "frequency": flat["meter_frequency"],
+            "pf_r": flat["meter_pf_r"],
+            "pf_y": flat["meter_pf_y"],
+            "pf_b": flat["meter_pf_b"],
+            "pf_t": flat["meter_pf_t"],
+            "p_r": flat["meter_p_r"],
+            "p_y": flat["meter_p_y"],
+            "p_b": flat["meter_p_b"],
+            "p_t": flat["meter_p_t"],
+        },
+        "dht": {
+            "temperature": flat["temperature"],
+            "humidity": flat["humidity"],
+        },
+    }
 
 @app.get("/history")
 def get_history(
