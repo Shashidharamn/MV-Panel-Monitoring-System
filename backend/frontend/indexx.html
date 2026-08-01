@@ -454,6 +454,7 @@
                 <th>Temperature</th>
                 <th>Humidity</th>
                 <th>Fault Status</th>
+                <th>Action</th>
               </tr>
             </thead>
             <tbody id="historyTableBody">
@@ -486,6 +487,43 @@
   <footer class="app-footer">
     <p>Substation Automation & Protection Monitoring System • ABB REJ601 & EMS-01 Modbus RTU Interface • FastAPI + PostgreSQL Backend</p>
   </footer>
+
+  <!-- ==========================================================================
+       RECORD DETAILS MODAL (View Details feature)
+       Populated entirely from the record data already returned by GET /history.
+       No extra API calls are made when this modal is opened.
+       ========================================================================== -->
+  <div id="recordDetailsOverlay" class="modal-overlay hidden">
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <i class="fa-solid fa-file-waveform"></i>
+          <h2 id="modalTitle">Historical Record Details</h2>
+        </div>
+        <button class="modal-close-btn" onclick="closeRecordDetails()" aria-label="Close">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- All section cards are injected here by JS (renderRecordDetailsModal) -->
+      <div class="modal-body" id="modalBody">
+      </div>
+
+      <div class="modal-footer">
+        <button class="action-btn download-btn" onclick="exportRecordExcel()">
+          <i class="fa-solid fa-file-excel"></i> Export This Record to Excel
+        </button>
+        <button class="action-btn download-btn" onclick="exportRecordPDF()">
+          <i class="fa-solid fa-file-pdf"></i> Export This Record to PDF
+        </button>
+        <button class="action-btn clear-btn" onclick="closeRecordDetails()">
+          <i class="fa-solid fa-xmark"></i> Close
+        </button>
+      </div>
+
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

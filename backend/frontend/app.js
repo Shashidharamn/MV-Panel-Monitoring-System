@@ -10,9 +10,10 @@
 // (Later this base URL will change to the deployed Render URL - nothing else
 //  in this file needs to change when that happens)
 // ==========================================================================
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = "https://mv-panel-monitoring-system.onrender.com";
 const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
 const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
+const DELETE_HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
 const POLL_INTERVAL_MS = 2000;
 
 let pollIntervalHandle = null;
@@ -25,6 +26,7 @@ let isShowingHistorical = false;
 
 // Holds only the records currently displayed in the historical table,
 // used as the source for Excel/PDF export ("export only what's displayed")
+// and also as the source for the "View Details" modal (Section: NEW FEATURE).
 let currentHistoricalRecords = [];
 
 // Helper function to check for null, undefined, or NaN safely
@@ -498,12 +500,26 @@ function getHistoryFilters() {
   return { startDate, endDate, panelId };
 }
 
+// Best-effort JSON parse of a fetch Response body. Returns null if the body
+// isn't valid JSON (e.g. an empty body) instead of throwing.
+async function safeReadJson(response) {
+  try {
+    return await response.json();
+  } catch (_e) {
+    return null;
+  }
+}
+
 // GET /history?start_date=...&end_date=...&panel_id=...
 async function fetchHistoricalData() {
   const { startDate, endDate, panelId } = getHistoryFilters();
 
-  if (!startDate || !endDate) {
-    alert('Please select both Start Date and End Date.');
+  if (!startDate) {
+    alert('Please select a Start Date.');
+    return;
+  }
+  if (!endDate) {
+    alert('Please select an End Date.');
     return;
   }
 
@@ -521,12 +537,16 @@ async function fetchHistoricalData() {
 
   try {
     const response = await fetch(`${HISTORY_ENDPOINT}?${params.toString()}`);
+    const payload = await safeReadJson(response);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      // Surface the backend's actual validation/error message (e.g. a bad
+      // date format) instead of a generic "unable to load" string.
+      const detail = (payload && payload.detail) ? payload.detail : `Request failed (HTTP ${response.status}).`;
+      throw new Error(detail);
     }
 
-    const records = await response.json();
+    const records = payload;
 
     if (!Array.isArray(records) || records.length === 0) {
       currentHistoricalRecords = [];
@@ -546,11 +566,13 @@ async function fetchHistoricalData() {
   } catch (err) {
     console.error('Error fetching historical data from FastAPI:', err);
     currentHistoricalRecords = [];
-    showHistoryMessage('Unable to load historical records. Please try again.');
+    showHistoryMessage(err.message || 'Unable to load historical records. Please try again.');
   }
 }
 
 // Renders the Historical Records table using the fields returned by /history
+// NOTE (View Details feature): an "Action" column is appended to every row.
+// The summary table's original 10 columns are untouched.
 function renderHistoricalTable(records) {
   const tbody = document.getElementById('historyTableBody');
   if (!tbody) return;
@@ -561,7 +583,7 @@ function renderHistoricalTable(records) {
     return;
   }
 
-  records.forEach(r => {
+  records.forEach((r, index) => {
     const row = document.createElement('tr');
 
     const dt = r.timestamp ? new Date(r.timestamp) : null;
@@ -577,6 +599,8 @@ function renderHistoricalTable(records) {
     const humidity = isInvalid(r.humidity) ? '--' : Number(r.humidity).toFixed(1);
     const faultStatus = r.live_fault_status || r.fault_status || '--';
 
+    // index into currentHistoricalRecords is passed to the modal so no
+    // second API call is needed - all fields are already in memory.
     row.innerHTML = `
       <td>${dateStr}</td>
       <td>${timeStr}</td>
@@ -588,6 +612,11 @@ function renderHistoricalTable(records) {
       <td>${temperature} °C</td>
       <td>${humidity} %</td>
       <td>${faultStatus}</td>
+      <td class="action-col">
+        <button class="view-details-btn" onclick="viewRecordDetails(${index})">
+          <i class="fa-solid fa-eye"></i> View Details
+        </button>
+      </td>
     `;
 
     tbody.appendChild(row);
@@ -715,6 +744,11 @@ async function clearHistoricalData() {
     return;
   }
 
+  if (new Date(startDate) > new Date(endDate)) {
+    alert('Start date/time cannot be after End date/time.');
+    return;
+  }
+
   const confirmMsg = panelId
     ? `Delete all historical records for Panel "${panelId}" between the selected dates? This action is permanent!`
     : `Delete ALL historical records between the selected dates? This action is permanent!`;
@@ -729,21 +763,364 @@ async function clearHistoricalData() {
   if (panelId) params.set('panel_id', panelId);
 
   try {
-    const response = await fetch(`${HISTORY_ENDPOINT}?${params.toString()}`, {
+    const response = await fetch(`${DELETE_HISTORY_ENDPOINT}?${params.toString()}`, {
       method: 'DELETE'
     });
 
+    const payload = await safeReadJson(response);
+
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      const detail = (payload && payload.detail) ? payload.detail : `Request failed (HTTP ${response.status}).`;
+      throw new Error(detail);
     }
 
-    alert('Historical records deleted successfully.');
+    // Show the backend's real message/count rather than a hardcoded string.
+    const message = (payload && payload.message)
+      ? payload.message
+      : 'Historical records deleted successfully.';
+    alert(message);
 
     // Refresh the table and graph with whatever remains for this filter
     await fetchHistoricalData();
 
   } catch (err) {
     console.error('Error deleting historical data via FastAPI:', err);
-    alert('Error deleting historical records. Please try again.');
+    alert(err.message || 'Error deleting historical records. Please try again.');
   }
+}
+
+/* ==========================================================================
+   NEW FEATURE: VIEW DETAILS MODAL
+   ==========================================================================
+   Opens a popup showing every field returned by GET /history for one
+   selected record. No new API call is made - the record already lives in
+   `currentHistoricalRecords` (the same array the table and export use).
+
+   FIELD NAME NOTE:
+   The summary table only reads fields it already knows the exact PostgreSQL
+   column names for (panel_id, timestamp, meter_v_r, meter_frequency, etc.).
+   The extra detail fields requested for this popup (relay pickups, PF/Power
+   per phase, event info, fault record stages, etc.) were not previously
+   consumed anywhere in this codebase, so their exact column names in your
+   `/history` response are not yet confirmed here.
+
+   To stay safe, `pick()` below tries a short list of the most likely column
+   name variants for each field (e.g. "relay_pickup_phase" or "pickup_phase")
+   and falls back to "--" if none match. If your actual API uses different
+   column names, just add them to the relevant candidate array - no other
+   code needs to change.
+   ========================================================================== */
+
+// Tries each candidate key (in order) against a record and returns the
+// first defined, non-null value found. Returns null if none match.
+function pick(record, candidates) {
+  for (const key of candidates) {
+    const val = record?.[key];
+    if (val !== undefined && val !== null && val !== '') return val;
+  }
+  return null;
+}
+
+// Formats a raw value for display inside the modal: numbers get fixed
+// decimals when a unit is supplied, everything else is shown as-is.
+function fmtDetail(val, unit = '', decimals = null) {
+  if (val === null || val === undefined || val === '') return '--';
+  if (decimals !== null && !isInvalid(val)) {
+    return `${Number(val).toFixed(decimals)}${unit ? ' ' + unit : ''}`;
+  }
+  return `${val}${unit ? ' ' + unit : ''}`;
+}
+
+// Builds one label/value "detail-field" box
+function detailFieldHTML(label, value) {
+  return `
+    <div class="detail-field">
+      <span class="detail-field-label">${label}</span>
+      <span class="detail-field-value">${value}</span>
+    </div>
+  `;
+}
+
+// Builds a full section card: title + icon + a grid of detail fields
+function detailSectionHTML(icon, title, fieldsHTML) {
+  return `
+    <div class="detail-section">
+      <div class="detail-section-title"><i class="${icon}"></i> ${title}</div>
+      <div class="detail-fields-grid">
+        ${fieldsHTML}
+      </div>
+    </div>
+  `;
+}
+
+// Opens the modal for the record at the given index within
+// currentHistoricalRecords (index comes from the "View Details" button).
+function viewRecordDetails(index) {
+  const record = currentHistoricalRecords[index];
+  if (!record) {
+    alert('Unable to load this record. Please search again.');
+    return;
+  }
+
+  renderRecordDetailsModal(record);
+
+  document.getElementById('recordDetailsOverlay').classList.remove('hidden');
+  // Track which record is open so the export buttons know what to export.
+  document.getElementById('recordDetailsOverlay').dataset.recordIndex = index;
+}
+
+function closeRecordDetails() {
+  document.getElementById('recordDetailsOverlay').classList.add('hidden');
+}
+
+// Close the modal when clicking the dark overlay background (not the box itself)
+document.addEventListener('DOMContentLoaded', () => {
+  const overlay = document.getElementById('recordDetailsOverlay');
+  if (overlay) {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeRecordDetails();
+    });
+  }
+  // Close on Escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const ov = document.getElementById('recordDetailsOverlay');
+      if (ov && !ov.classList.contains('hidden')) closeRecordDetails();
+    }
+  });
+});
+
+// Builds and injects all 7 section cards for the given record
+function renderRecordDetailsModal(r) {
+  const modalBody = document.getElementById('modalBody');
+  if (!modalBody) return;
+
+  const dt = r.timestamp ? new Date(r.timestamp) : null;
+  const validDt = dt && !isNaN(dt.getTime());
+  const fullTimestamp = validDt ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : (r.timestamp || '--');
+
+  document.getElementById('modalTitle').innerText = `Record Details - Panel ${r.panel_id ?? '--'}`;
+
+  let html = '';
+
+  // -------------------- SECTION 1: GENERAL INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-circle-info', 'General Information',
+    detailFieldHTML('Panel ID', fmtDetail(r.panel_id)) +
+    detailFieldHTML('Timestamp', fmtDetail(fullTimestamp)) +
+    detailFieldHTML('Relay Status', fmtDetail(pick(r, ['current_relay_status', 'relay_status'])))
+  );
+
+  // -------------------- SECTION 2: RELAY INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-shield-halved', 'Relay Information',
+    detailFieldHTML('Relay I1', fmtDetail(pick(r, ['relay_i1']), 'A', 2)) +
+    detailFieldHTML('Relay I2', fmtDetail(pick(r, ['relay_i2']), 'A', 2)) +
+    detailFieldHTML('Relay I3', fmtDetail(pick(r, ['relay_i3']), 'A', 2)) +
+    detailFieldHTML('Relay I0', fmtDetail(pick(r, ['relay_i0']), 'A', 2)) +
+    detailFieldHTML('Pickup Phase', fmtDetail(pick(r, ['relay_pickup_phase', 'pickup_phase']), 'A', 2)) +
+    detailFieldHTML('Pickup Earth', fmtDetail(pick(r, ['relay_pickup_earth', 'pickup_earth']), 'A', 2)) +
+    detailFieldHTML('Operation Counter', fmtDetail(pick(r, ['relay_op_counter', 'op_counter']))) +
+    detailFieldHTML('Negative Sequence Current', fmtDetail(pick(r, ['relay_neg_seq', 'neg_seq']), 'A', 2)) +
+    detailFieldHTML('Thermal Level', fmtDetail(pick(r, ['relay_thermal_level', 'thermal_level']), '%')) +
+    detailFieldHTML('Relay RTC', fmtDetail(pick(r, ['relay_rtc', 'rtc'])))
+  );
+
+  // -------------------- SECTION 3: POWER QUALITY METER --------------------
+  html += detailSectionHTML('fa-solid fa-gauge-high', 'Power Quality Meter',
+    detailFieldHTML('Voltage R', fmtDetail(r.meter_v_r, 'V', 1)) +
+    detailFieldHTML('Voltage Y', fmtDetail(r.meter_v_y, 'V', 1)) +
+    detailFieldHTML('Voltage B', fmtDetail(r.meter_v_b, 'V', 1)) +
+    detailFieldHTML('Current R', fmtDetail(pick(r, ['meter_i_r']), 'A', 1)) +
+    detailFieldHTML('Current Y', fmtDetail(pick(r, ['meter_i_y']), 'A', 1)) +
+    detailFieldHTML('Current B', fmtDetail(pick(r, ['meter_i_b']), 'A', 1)) +
+    detailFieldHTML('Frequency', fmtDetail(r.meter_frequency, 'Hz', 2)) +
+    detailFieldHTML('PF - R', fmtDetail(pick(r, ['meter_pf_r']), '', 2)) +
+    detailFieldHTML('PF - Y', fmtDetail(pick(r, ['meter_pf_y']), '', 2)) +
+    detailFieldHTML('PF - B', fmtDetail(pick(r, ['meter_pf_b']), '', 2)) +
+    detailFieldHTML('Total PF', fmtDetail(pick(r, ['meter_pf_t']), '', 2)) +
+    detailFieldHTML('Power R', fmtDetail(pick(r, ['meter_p_r']), 'kW', 2)) +
+    detailFieldHTML('Power Y', fmtDetail(pick(r, ['meter_p_y']), 'kW', 2)) +
+    detailFieldHTML('Power B', fmtDetail(pick(r, ['meter_p_b']), 'kW', 2)) +
+    detailFieldHTML('Total Power', fmtDetail(pick(r, ['meter_p_t']), 'kW', 2))
+  );
+
+  // -------------------- SECTION 4: ENVIRONMENT --------------------
+  html += detailSectionHTML('fa-solid fa-cloud-sun-rain', 'Environment',
+    detailFieldHTML('Temperature', fmtDetail(r.temperature, '°C', 1)) +
+    detailFieldHTML('Humidity', fmtDetail(r.humidity, '%', 1))
+  );
+
+  // -------------------- SECTION 5: EVENT INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-list-check', 'Event Information',
+    detailFieldHTML('Event Type', fmtDetail(pick(r, ['event_type']))) +
+    detailFieldHTML('Event Subtype', fmtDetail(pick(r, ['event_subtype']))) +
+    detailFieldHTML('Event Timestamp', fmtDetail(pick(r, ['event_timestamp'])))
+  );
+
+  // -------------------- SECTION 6: FAULT INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-triangle-exclamation', 'Fault Information',
+    detailFieldHTML('Current Fault Status', fmtDetail(pick(r, ['current_fault_status', 'current_relay_status']))) +
+    detailFieldHTML('Live Fault Status', fmtDetail(pick(r, ['live_fault_status']))) +
+    detailFieldHTML('Historical Fault Status', fmtDetail(pick(r, ['historical_fault_status', 'fault_status'])))
+  );
+
+  // -------------------- SECTION 7: FAULT RECORD --------------------
+  const preStartFields =
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_pre_start_i1', 'pre_start_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_pre_start_i2', 'pre_start_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_pre_start_i3', 'pre_start_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_pre_start_i0', 'pre_start_i0']), 'A', 2));
+
+  const atStartFields =
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_at_start_i1', 'at_start_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_at_start_i2', 'at_start_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_at_start_i3', 'at_start_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_at_start_i0', 'at_start_i0']), 'A', 2)) +
+    detailFieldHTML('Start Timestamp', fmtDetail(pick(r, ['fr_at_start_time', 'at_start_time'])));
+
+  const atTripFields =
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_at_trip_i1', 'at_trip_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_at_trip_i2', 'at_trip_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_at_trip_i3', 'at_trip_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_at_trip_i0', 'at_trip_i0']), 'A', 2)) +
+    detailFieldHTML('Trip Timestamp', fmtDetail(pick(r, ['fr_at_trip_time', 'at_trip_time'])));
+
+  const faultRecordFields = `
+    <div class="detail-subgroup">
+      <div class="detail-subgroup-title">Pre Start</div>
+      <div class="detail-fields-grid">${preStartFields}</div>
+    </div>
+    <div class="detail-subgroup">
+      <div class="detail-subgroup-title">At Start</div>
+      <div class="detail-fields-grid">${atStartFields}</div>
+    </div>
+    <div class="detail-subgroup trip-subgroup">
+      <div class="detail-subgroup-title">At Trip</div>
+      <div class="detail-fields-grid">${atTripFields}</div>
+    </div>
+  `;
+
+  html += `
+    <div class="detail-section">
+      <div class="detail-section-title"><i class="fa-solid fa-clock-rotate-left"></i> Fault Record</div>
+      ${faultRecordFields}
+    </div>
+  `;
+
+  modalBody.innerHTML = html;
+}
+
+// -------------------- Single-record export: Excel --------------------
+function exportRecordExcel() {
+  const overlay = document.getElementById('recordDetailsOverlay');
+  const index = Number(overlay.dataset.recordIndex);
+  const record = currentHistoricalRecords[index];
+  if (!record) {
+    alert('No record selected to export.');
+    return;
+  }
+
+  const rows = buildFullExportRow(record);
+  const worksheet = XLSX.utils.json_to_sheet([rows]);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Record Detail');
+  XLSX.writeFile(workbook, `record_${record.panel_id ?? 'panel'}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+// -------------------- Single-record export: PDF --------------------
+function exportRecordPDF() {
+  const overlay = document.getElementById('recordDetailsOverlay');
+  const index = Number(overlay.dataset.recordIndex);
+  const record = currentHistoricalRecords[index];
+  if (!record) {
+    alert('No record selected to export.');
+    return;
+  }
+
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+
+  doc.setFontSize(14);
+  doc.text(`Historical Record Detail - Panel ${record.panel_id ?? '--'}`, 14, 15);
+
+  const rowObj = buildFullExportRow(record);
+  const body = Object.entries(rowObj).map(([label, value]) => [label, String(value)]);
+
+  doc.autoTable({
+    head: [['Field', 'Value']],
+    body,
+    startY: 22,
+    styles: { fontSize: 8 },
+    headStyles: { fillColor: [6, 182, 212] }
+  });
+
+  doc.save(`record_${record.panel_id ?? 'panel'}_${new Date().toISOString().slice(0, 10)}.pdf`);
+}
+
+// Flattens every field shown in the modal into one label -> value object,
+// reused by both single-record export functions above.
+function buildFullExportRow(r) {
+  const dt = r.timestamp ? new Date(r.timestamp) : null;
+  const validDt = dt && !isNaN(dt.getTime());
+  const fullTimestamp = validDt ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : (r.timestamp || '');
+
+  return {
+    'Panel ID': r.panel_id ?? '',
+    'Timestamp': fullTimestamp,
+    'Relay Status': pick(r, ['current_relay_status', 'relay_status']) ?? '',
+
+    'Relay I1 (A)': pick(r, ['relay_i1']) ?? '',
+    'Relay I2 (A)': pick(r, ['relay_i2']) ?? '',
+    'Relay I3 (A)': pick(r, ['relay_i3']) ?? '',
+    'Relay I0 (A)': pick(r, ['relay_i0']) ?? '',
+    'Pickup Phase (A)': pick(r, ['relay_pickup_phase', 'pickup_phase']) ?? '',
+    'Pickup Earth (A)': pick(r, ['relay_pickup_earth', 'pickup_earth']) ?? '',
+    'Operation Counter': pick(r, ['relay_op_counter', 'op_counter']) ?? '',
+    'Negative Sequence Current (A)': pick(r, ['relay_neg_seq', 'neg_seq']) ?? '',
+    'Thermal Level (%)': pick(r, ['relay_thermal_level', 'thermal_level']) ?? '',
+    'Relay RTC': pick(r, ['relay_rtc', 'rtc']) ?? '',
+
+    'Voltage R (V)': r.meter_v_r ?? '',
+    'Voltage Y (V)': r.meter_v_y ?? '',
+    'Voltage B (V)': r.meter_v_b ?? '',
+    'Current R (A)': pick(r, ['meter_i_r']) ?? '',
+    'Current Y (A)': pick(r, ['meter_i_y']) ?? '',
+    'Current B (A)': pick(r, ['meter_i_b']) ?? '',
+    'Frequency (Hz)': r.meter_frequency ?? '',
+    'PF-R': pick(r, ['meter_pf_r']) ?? '',
+    'PF-Y': pick(r, ['meter_pf_y']) ?? '',
+    'PF-B': pick(r, ['meter_pf_b']) ?? '',
+    'Total PF': pick(r, ['meter_pf_t']) ?? '',
+    'Power R (kW)': pick(r, ['meter_p_r']) ?? '',
+    'Power Y (kW)': pick(r, ['meter_p_y']) ?? '',
+    'Power B (kW)': pick(r, ['meter_p_b']) ?? '',
+    'Total Power (kW)': pick(r, ['meter_p_t']) ?? '',
+
+    'Temperature (C)': r.temperature ?? '',
+    'Humidity (%)': r.humidity ?? '',
+
+    'Event Type': pick(r, ['event_type']) ?? '',
+    'Event Subtype': pick(r, ['event_subtype']) ?? '',
+    'Event Timestamp': pick(r, ['event_timestamp']) ?? '',
+
+    'Current Fault Status': pick(r, ['current_fault_status', 'current_relay_status']) ?? '',
+    'Live Fault Status': pick(r, ['live_fault_status']) ?? '',
+    'Historical Fault Status': pick(r, ['historical_fault_status', 'fault_status']) ?? '',
+
+    'Fault Record Pre-Start I1 (A)': pick(r, ['fr_pre_start_i1', 'pre_start_i1']) ?? '',
+    'Fault Record Pre-Start I2 (A)': pick(r, ['fr_pre_start_i2', 'pre_start_i2']) ?? '',
+    'Fault Record Pre-Start I3 (A)': pick(r, ['fr_pre_start_i3', 'pre_start_i3']) ?? '',
+    'Fault Record Pre-Start I0 (A)': pick(r, ['fr_pre_start_i0', 'pre_start_i0']) ?? '',
+
+    'Fault Record At-Start I1 (A)': pick(r, ['fr_at_start_i1', 'at_start_i1']) ?? '',
+    'Fault Record At-Start I2 (A)': pick(r, ['fr_at_start_i2', 'at_start_i2']) ?? '',
+    'Fault Record At-Start I3 (A)': pick(r, ['fr_at_start_i3', 'at_start_i3']) ?? '',
+    'Fault Record At-Start I0 (A)': pick(r, ['fr_at_start_i0', 'at_start_i0']) ?? '',
+    'Fault Record Start Timestamp': pick(r, ['fr_at_start_time', 'at_start_time']) ?? '',
+
+    'Fault Record At-Trip I1 (A)': pick(r, ['fr_at_trip_i1', 'at_trip_i1']) ?? '',
+    'Fault Record At-Trip I2 (A)': pick(r, ['fr_at_trip_i2', 'at_trip_i2']) ?? '',
+    'Fault Record At-Trip I3 (A)': pick(r, ['fr_at_trip_i3', 'at_trip_i3']) ?? '',
+    'Fault Record At-Trip I0 (A)': pick(r, ['fr_at_trip_i0', 'at_trip_i0']) ?? '',
+    'Fault Record Trip Timestamp': pick(r, ['fr_at_trip_time', 'at_trip_time']) ?? ''
+  };
 }
