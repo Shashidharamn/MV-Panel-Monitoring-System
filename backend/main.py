@@ -543,6 +543,118 @@ def row_to_dict(row, timestamp_as_string=False):
     }
 
 
+# =============================================================================
+# FAULT-AWARE RELAY CURRENT / STATUS RESOLUTION
+#
+# Single source of truth used by BOTH /latest and /history so the live
+# dashboard, the historical table, the historical chart, and the exports
+# can never disagree with each other.
+#
+# Why this is needed: the relay's raw "live" current readings
+# (relay_i1/i2/i3/i0) reflect whatever the CT is measuring at THIS instant.
+# The moment a breaker trips open on an Overcurrent or Earth fault, that
+# live reading collapses (e.g. to ~0A or some partial residual value) even
+# though the fault event itself happened at a specific, higher current.
+# The relay separately stores that real trip-moment snapshot in its
+# "At Trip" fault record (fr_attrip_i1/i2/i3/i0), which does NOT change
+# on every poll - it only updates on the next trip. So whenever a record
+# reports an active fault, we display the At-Trip snapshot instead of the
+# live reading. Once the fault clears, later records go back to reporting
+# genuine live current, unaffected by anything shown previously.
+# =============================================================================
+
+# -----------------------------------------------------------------------
+# Event-type codes used ONLY to disambiguate the rare case where the
+# relay reports BOTH overcurrent_fault and earth_fault true on the same
+# record. event_type / event_subtype are the relay's own record of which
+# protection stage actually operated, so they're more trustworthy than
+# guessing from the two booleans alone.
+#
+# NOT YET CONFIGURED: these sets must be populated with the exact
+# event_type (and/or event_subtype) values from the REJ601's own
+# event/disturbance-record code table for "Earth fault protection
+# operated" and "Overcurrent protection operated". That table isn't
+# part of main.py or anything supplied so far - leaving these empty
+# rather than guessing numbers, since a wrong guess would silently
+# misclassify faults again, just through a different path. Until these
+# are filled in, the ambiguous both-true case falls back to Earth Fault
+# (see comment in derive_fault_status below).
+# -----------------------------------------------------------------------
+EARTH_FAULT_EVENT_TYPES: set = set()   # TODO: fill in from REJ601 event code table
+OVERCURRENT_EVENT_TYPES: set = set()   # TODO: fill in from REJ601 event code table
+
+
+def derive_fault_status(overcurrent_fault, earth_fault, event_type=None, event_subtype=None) -> str:
+    """
+    Canonical, consistently-worded fault status text for a record. This is
+    the ONLY place in the entire application (backend or frontend) where
+    fault message text is defined. Every caller (fault_status,
+    live_fault_status, historical_fault_status, fault_record1.at_trip_status)
+    passes the SAME overcurrent_fault / earth_fault / event_type /
+    event_subtype for that record and gets back this same string - that's
+    what guarantees the three fault fields can never disagree for a given
+    record, and that the message wording is identical everywhere it's
+    displayed (Historical Records table, chart, exports, View Details, and
+    the live dashboard banner).
+
+    Exactly three possible return values (standardized wording - do not
+    introduce any other phrasing anywhere else in the codebase):
+      - "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
+      - "Fault Detected - E/F (Single Line Earth Fault Current)"
+      - "No Fault Detected"
+
+    - If only one of overcurrent_fault / earth_fault is true, that's
+      unambiguous and used directly.
+    - If BOTH are true at once, the booleans alone can't tell you which
+      one actually operated, so event_type / event_subtype (the relay's
+      own event record) is used to decide instead of blindly prioritizing
+      one flag. See EARTH_FAULT_EVENT_TYPES / OVERCURRENT_EVENT_TYPES
+      above - until those are populated with real REJ601 codes, this
+      falls back to Earth Fault as the higher-consequence condition to
+      surface, rather than silently defaulting to Overcurrent.
+    """
+    if overcurrent_fault and earth_fault:
+        if event_type in EARTH_FAULT_EVENT_TYPES or event_subtype in EARTH_FAULT_EVENT_TYPES:
+            return "Fault Detected - E/F (Single Line Earth Fault Current)"
+        if event_type in OVERCURRENT_EVENT_TYPES or event_subtype in OVERCURRENT_EVENT_TYPES:
+            return "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
+        # Ambiguous, or event code tables above not configured yet.
+        return "Fault Detected - E/F (Single Line Earth Fault Current)"
+
+    if earth_fault:
+        return "Fault Detected - E/F (Single Line Earth Fault Current)"
+    if overcurrent_fault:
+        return "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
+    return "No Fault Detected"
+
+
+def effective_relay_currents(flat: dict) -> Tuple[float, float, float, float]:
+    """
+    Returns the (i1, i2, i3, i0) values that should be DISPLAYED for a
+    given record.
+
+    - If this record shows an active Overcurrent or Earth fault, the
+      relay's own "At Trip" fault-record values are used - this is the
+      real current present at the moment of the trip, and it is never
+      later swapped out for a subsequent live reading.
+    - Otherwise, the genuine live relay readings are returned unchanged,
+      so normal day-to-day monitoring is unaffected.
+    """
+    if flat.get("overcurrent_fault") or flat.get("earth_fault"):
+        return (
+            flat["fr_attrip_i1"],
+            flat["fr_attrip_i2"],
+            flat["fr_attrip_i3"],
+            flat["fr_attrip_i0"],
+        )
+    return (
+        flat["relay_i1"],
+        flat["relay_i2"],
+        flat["relay_i3"],
+        flat["relay_i0"],
+    )
+
+
 # -----------------------------
 # Get Latest Sensor Data
 # -----------------------------
@@ -570,6 +682,18 @@ LIMIT 1;
 
     flat = row_to_dict(row, timestamp_as_string=False)
 
+    # Resolve the currents/fault status to display using the shared,
+    # fault-aware logic (see effective_relay_currents / derive_fault_status
+    # above) so an active Overcurrent/Earth fault shows the relay's real
+    # At-Trip current instead of a misleading post-trip live reading.
+    disp_i1, disp_i2, disp_i3, disp_i0 = effective_relay_currents(flat)
+    fault_status_text = derive_fault_status(
+        flat["overcurrent_fault"],
+        flat["earth_fault"],
+        flat["event_type"],
+        flat["event_subtype"],
+    )
+
     def _phase_string(i1, i2, i3, i0):
         return f"I1={i1} I2={i2} I3={i3} I0={i0}"
 
@@ -578,15 +702,15 @@ LIMIT 1;
             "sg_active": 1,
             "pickup_phase": flat["pickup_phase"],
             "pickup_earth": flat["pickup_earth"],
-            "i1": flat["relay_i1"],
-            "i2": flat["relay_i2"],
-            "i3": flat["relay_i3"],
-            "i0": flat["relay_i0"],
+            "i1": disp_i1,
+            "i2": disp_i2,
+            "i3": disp_i3,
+            "i0": disp_i0,
             "op_counter": flat["operation_counter"],
             "neg_seq": flat["negative_sequence_current"],
             "thermal_level": flat["thermal_level"],
             "rtc": flat["relay_rtc"],
-            "live_fault_status": flat["live_fault_status"],
+            "live_fault_status": fault_status_text,
             "event": {
                 "type": flat["event_type"],
                 "subtype": flat["event_subtype"],
@@ -613,6 +737,7 @@ LIMIT 1;
                     flat["fr_attrip_i0"],
                 ),
                 "at_trip_time": flat["fr_attrip_timestamp"],
+                "at_trip_status": fault_status_text,
             },
         },
         "meter": {
@@ -769,7 +894,31 @@ def get_history(
     if not rows:
         return []
 
-    history = [row_to_dict(row, timestamp_as_string=True) for row in rows]
+    # Every historical record is resolved through the same fault-aware
+    # logic used by /latest: while that record shows an active Overcurrent
+    # or Earth fault, its relay currents come from the relay's own At-Trip
+    # fault record (a permanent snapshot), never from the live reading.
+    # This is what makes the historical log a true, unchanging record of
+    # what actually happened at trip time, even long after the fault
+    # clears and live current returns to normal.
+    history = []
+    for row in rows:
+        rec = row_to_dict(row, timestamp_as_string=True)
+
+        i1, i2, i3, i0 = effective_relay_currents(rec)
+        rec["relay_i1"], rec["relay_i2"], rec["relay_i3"], rec["relay_i0"] = i1, i2, i3, i0
+
+        status_text = derive_fault_status(
+            rec["overcurrent_fault"],
+            rec["earth_fault"],
+            rec["event_type"],
+            rec["event_subtype"],
+        )
+        rec["fault_status"] = status_text
+        rec["live_fault_status"] = status_text
+        rec["historical_fault_status"] = status_text
+
+        history.append(rec)
 
     return history
 

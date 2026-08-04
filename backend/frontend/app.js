@@ -34,6 +34,62 @@ function isInvalid(val) {
   return val === null || val === undefined || isNaN(Number(val));
 }
 
+// -----------------------------------------------------------------------
+// Shared fault-text classifier.
+// The backend's derive_fault_status() (main.py) is the ONLY place fault
+// message text is defined. It always sends one of exactly three canonical
+// strings, used verbatim and unmodified everywhere in this file:
+//   "No Fault Detected"
+//   "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
+//   "Fault Detected - E/F (Single Line Earth Fault Current)"
+// This file never constructs, hardcodes, or rewords a fault message - it
+// only displays fault_status / live_fault_status / historical_fault_status
+// exactly as received from the API.
+// IMPORTANT: this must NOT be a plain substring check for "fault detected" -
+// "No Fault Detected" also contains that substring, which previously caused
+// the healthy state to be misclassified as faulted. Checking the prefix
+// avoids that.
+// -----------------------------------------------------------------------
+function isActiveFault(faultStatusText) {
+  return String(faultStatusText || '').trim().toLowerCase().startsWith('fault detected');
+}
+
+// -----------------------------------------------------------------------
+// Fault-aware relay current resolver (frontend safety net).
+//
+// The backend (/history in main.py) already resolves relay_i1..i0 to the
+// relay's "At Trip" fault-record snapshot whenever overcurrent_fault or
+// earth_fault is true on that row. This function mirrors that exact same
+// rule on the frontend, so every historical display - the table, the
+// chart, both bulk exports, the single-record exports, and the View
+// Details "Relay Currents" section - reads through ONE shared resolver
+// instead of each place picking its own field. That guarantees they can
+// never disagree with each other or with the View Details -> Fault
+// Record -> At Trip values, regardless of what the API happens to send
+// for relay_i1..i0 on a given row.
+//
+//   If overcurrent_fault or earth_fault is true:
+//     use fr_attrip_i1 / fr_attrip_i2 / fr_attrip_i3 / fr_attrip_i0
+//   Otherwise:
+//     use relay_i1 / relay_i2 / relay_i3 / relay_i0
+// -----------------------------------------------------------------------
+function resolveRelayCurrents(record) {
+  if (record && (record.overcurrent_fault || record.earth_fault)) {
+    return {
+      i1: record.fr_attrip_i1,
+      i2: record.fr_attrip_i2,
+      i3: record.fr_attrip_i3,
+      i0: record.fr_attrip_i0,
+    };
+  }
+  return {
+    i1: record ? record.relay_i1 : null,
+    i2: record ? record.relay_i2 : null,
+    i3: record ? record.relay_i3 : null,
+    i0: record ? record.relay_i0 : null,
+  };
+}
+
 // Live chart telemetry buffer (last 20 samples)
 const chartDataBuffer = {
   timestamps: [],
@@ -159,6 +215,13 @@ async function fetchLatestData() {
 
 /* ==========================================================================
    Telemetry Processing & UI Updates (Live Monitoring - unchanged)
+
+   NOTE ON RELAY CURRENTS: relay.i1/i2/i3/i0 arrive ALREADY RESOLVED by the
+   backend (/latest) - while an Overcurrent or Earth fault is active on the
+   latest record, these values are the relay's own "At Trip" fault-record
+   snapshot rather than the raw live reading, so this section never needs to
+   choose between the two itself. Once the fault clears on a later poll,
+   the backend automatically resumes sending genuine live current.
    ========================================================================== */
 function processTelemetryData(data) {
   updateTimestamp();
@@ -194,14 +257,40 @@ function processTelemetryData(data) {
   updatePhaseAlarm('pillI3', i3, pickupIphase);
   updatePhaseAlarm('pillI0', i0, pickupIearth);
 
-  // Display Live Fault Status
-  const liveFault = relay.live_fault_status || "No Fault Detected";
+  /* ------------------------------------------------------------------
+     LIVE FAULT STATUS
+     ------------------------------------------------------------------
+     The banner/icon/text are fully re-derived from scratch on every
+     single polling cycle using ONLY `relay.live_fault_status` from the
+     latest record returned by /latest (already a canonical string from
+     the backend's derive_fault_status(): "No Fault Detected" /
+     "Fault Detected - O/C (Overcurrent Phase-to-Phase)" /
+     "Fault Detected - E/F (Single Line Earth Fault Current)"). Nothing
+     here is additive/sticky:
+     - `text.innerText` is reassigned every call (not appended to).
+     - `banner.className` is reassigned every call (not toggled), so a
+       "faulted" class from a previous cycle can never linger once the
+       new record reports healthy.
+     This guarantees a fault clears immediately the moment the next
+     polled record shows no fault, and a new fault is shown immediately
+     the moment the next polled record reports one.
+
+     isActiveFault() checks the PREFIX of the string, not a bare
+     substring match - "No Fault Detected" must never be classified as
+     an active fault.
+     ------------------------------------------------------------------ */
+  const latestFaultValue = (relay.live_fault_status && String(relay.live_fault_status).trim())
+    ? String(relay.live_fault_status).trim()
+    : "No Fault Detected";
+
   const banner = document.getElementById('faultSummaryBanner');
   const icon = document.getElementById('faultIcon');
   const text = document.getElementById('faultSummaryText');
-  text.innerText = liveFault;
 
-  if (liveFault.includes("Fault Detected")) {
+  // Always overwrite (never merge/append) with this cycle's value only.
+  text.innerText = latestFaultValue;
+
+  if (isActiveFault(latestFaultValue)) {
     banner.className = 'fault-summary-banner faulted';
     icon.className = 'fa-solid fa-triangle-exclamation';
   } else {
@@ -462,6 +551,13 @@ function pushChartBuffer(i1, i2, i3, i0, vr, vy, vb, temp, hum) {
    Source of truth: PostgreSQL, accessed exclusively through FastAPI
    GET  /history  -> search/filter records
    DELETE /history -> remove records matching the selected filters
+
+   NOTE ON RELAY CURRENTS: every read of relay current in this module goes
+   through resolveRelayCurrents(record) (defined near the top of this file)
+   instead of reading r.relay_i1/i2/i3/i0 directly. That guarantees the
+   table, the chart, both exports, and View Details -> Relay Currents can
+   never disagree with each other, or with View Details -> Fault Record ->
+   At Trip, regardless of what the API sends for relay_i1..i0 on a row.
    ========================================================================== */
 
 // Small numeric helpers used by table rendering, chart plotting and export
@@ -469,10 +565,11 @@ function numOrNull(v) {
   return isInvalid(v) ? null : Number(v);
 }
 
-function avgOf(a, b, c) {
-  const vals = [a, b, c].filter(v => !isInvalid(v)).map(Number);
-  if (vals.length === 0) return '--';
-  return (vals.reduce((sum, v) => sum + v, 0) / vals.length).toFixed(1);
+// Formats a raw numeric DB value to a fixed number of decimals, or '--'
+// if it is missing/invalid. Used by the Historical Records table so it
+// always shows the EXACT stored value (never an average) - CHANGE 2.
+function fmtNum(val, decimals = 2) {
+  return isInvalid(val) ? '--' : Number(val).toFixed(decimals);
 }
 
 function showHistoryMessage(msg) {
@@ -570,9 +667,37 @@ async function fetchHistoricalData() {
   }
 }
 
-// Renders the Historical Records table using the fields returned by /history
-// NOTE (View Details feature): an "Action" column is appended to every row.
-// The summary table's original 10 columns are untouched.
+/* ==========================================================================
+   CHANGE 5: REFRESH BUTTON
+   Resets the entire Historical Data Logs & Export section back to its
+   default empty state:
+     - Clears Start Date, End Date, Panel ID inputs
+     - Clears the searched history table and in-memory records
+     - Clears the historical chart and returns the shared chart to Live mode
+     - Disables "Show Live Chart" until another search is performed
+   ========================================================================== */
+function refreshHistoricalData() {
+  // Clear filter inputs
+  document.getElementById('histStart').value = '';
+  document.getElementById('histEnd').value = '';
+  document.getElementById('histPanelId').value = '';
+
+  // Clear searched history / in-memory records
+  currentHistoricalRecords = [];
+  renderHistoricalTable([]);
+  showHistoryMessage('Select a date range and click Search to view historical records.');
+
+  // Return chart to Live mode and clear any historical chart data
+  isShowingHistorical = false;
+  document.getElementById('resetLiveBtn').disabled = true;
+  updateChartDatasets();
+}
+
+// Renders the Historical Records table using the EXACT fields returned by
+// /history - CHANGE 2 & 3: no averages are calculated, every row's Fault
+// Status comes strictly from that row's own record, and Relay Currents
+// (including I0 Earth) go through resolveRelayCurrents() so they are the
+// At-Trip values whenever a fault was active on that row.
 function renderHistoricalTable(records) {
   const tbody = document.getElementById('historyTableBody');
   if (!tbody) return;
@@ -591,27 +716,32 @@ function renderHistoricalTable(records) {
     const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '--');
     const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '--') : '--');
 
-    const relayStatus = r.current_relay_status ?? '--';
-    const voltage = avgOf(r.meter_v_r, r.meter_v_y, r.meter_v_b);
-    const current = avgOf(r.meter_i_r, r.meter_i_y, r.meter_i_b);
-    const frequency = isInvalid(r.meter_frequency) ? '--' : Number(r.meter_frequency).toFixed(2);
-    const temperature = isInvalid(r.temperature) ? '--' : Number(r.temperature).toFixed(1);
-    const humidity = isInvalid(r.humidity) ? '--' : Number(r.humidity).toFixed(1);
-    const faultStatus = r.live_fault_status || r.fault_status || '--';
+    // Fault status is read fresh from THIS row's own record only - the
+    // backend already resolves it to one of the three canonical strings,
+    // so no other row's value can ever be echoed here.
+    const rawFault = r.live_fault_status || r.historical_fault_status || r.fault_status;
+    const faultStatus = (rawFault && String(rawFault).trim()) ? String(rawFault).trim() : 'No Fault Detected';
+    const isFaulted = isActiveFault(faultStatus);
 
-    // index into currentHistoricalRecords is passed to the modal so no
-    // second API call is needed - all fields are already in memory.
+    // Fault-aware relay currents - fr_attrip_* on a faulted row, live
+    // relay_* otherwise. Same resolver used by the chart and both exports.
+    const cur = resolveRelayCurrents(r);
+
     row.innerHTML = `
       <td>${dateStr}</td>
       <td>${timeStr}</td>
       <td>${r.panel_id ?? '--'}</td>
-      <td>${relayStatus}</td>
-      <td>${voltage} V</td>
-      <td>${current} A</td>
-      <td>${frequency} Hz</td>
-      <td>${temperature} °C</td>
-      <td>${humidity} %</td>
-      <td>${faultStatus}</td>
+      <td>${fmtNum(r.meter_v_r, 1)} V</td>
+      <td>${fmtNum(r.meter_v_y, 1)} V</td>
+      <td>${fmtNum(r.meter_v_b, 1)} V</td>
+      <td>${fmtNum(r.meter_i_r, 2)} A</td>
+      <td>${fmtNum(r.meter_i_y, 2)} A</td>
+      <td>${fmtNum(r.meter_i_b, 2)} A</td>
+      <td>${fmtNum(cur.i1, 2)} A</td>
+      <td>${fmtNum(cur.i2, 2)} A</td>
+      <td>${fmtNum(cur.i3, 2)} A</td>
+      <td>${fmtNum(cur.i0, 2)} A</td>
+      <td><span class="fault-badge ${isFaulted ? 'fault-bad' : 'fault-ok'}">${faultStatus}</span></td>
       <td class="action-col">
         <button class="view-details-btn" onclick="viewRecordDetails(${index})">
           <i class="fa-solid fa-eye"></i> View Details
@@ -623,7 +753,10 @@ function renderHistoricalTable(records) {
   });
 }
 
-// Plots the shared telemetry chart using historical records from /history
+// Plots the shared telemetry chart using historical records from /history.
+// Relay currents go through resolveRelayCurrents() for every record, so
+// this automatically plots At-Trip currents for any record with an active
+// fault, and genuine live currents otherwise - matching the table exactly.
 function updateHistoricalChart(records) {
   if (!chartInstance) return;
 
@@ -640,11 +773,12 @@ function updateHistoricalChart(records) {
   });
 
   if (activeChartMode === 'currents') {
+    const resolved = records.map(r => resolveRelayCurrents(r));
     chartInstance.data.datasets = [
-      { label: 'Relay I1 (A)', data: records.map(r => numOrNull(r.relay_i1)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I2 (A)', data: records.map(r => numOrNull(r.relay_i2)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I3 (A)', data: records.map(r => numOrNull(r.relay_i3)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I0 Earth (A)', data: records.map(r => numOrNull(r.relay_i0)), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
+      { label: 'Relay I1 (A)', data: resolved.map(c => numOrNull(c.i1)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I2 (A)', data: resolved.map(c => numOrNull(c.i2)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I3 (A)', data: resolved.map(c => numOrNull(c.i3)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
+      { label: 'Relay I0 Earth (A)', data: resolved.map(c => numOrNull(c.i0)), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
     ];
   } else if (activeChartMode === 'voltages') {
     chartInstance.data.datasets = [
@@ -670,7 +804,11 @@ function resetToLiveChart() {
   updateChartDatasets();
 }
 
-// Builds a flat, export-friendly row shape shared by Excel & PDF export
+// Builds a flat, export-friendly row shape shared by Excel & PDF export.
+// Mirrors the Historical Records table columns exactly (CHANGE 2, plus the
+// Relay I0 Earth column) so what the user sees on screen is what gets
+// exported - no averages, and no live-vs-At-Trip mismatch. Relay currents
+// go through the same resolveRelayCurrents() resolver as the table/chart.
 function buildExportRows(records) {
   return records.map(r => {
     const dt = r.timestamp ? new Date(r.timestamp) : null;
@@ -678,17 +816,26 @@ function buildExportRows(records) {
     const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
     const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
 
+    const rawFault = r.live_fault_status || r.historical_fault_status || r.fault_status;
+    const faultStatus = (rawFault && String(rawFault).trim()) ? String(rawFault).trim() : 'No Fault Detected';
+
+    const cur = resolveRelayCurrents(r);
+
     return {
       Date: dateStr,
       Time: timeStr,
       'Panel ID': r.panel_id ?? '',
-      'Relay Status': r.current_relay_status ?? '',
-      'Voltage (V)': avgOf(r.meter_v_r, r.meter_v_y, r.meter_v_b),
-      'Current (A)': avgOf(r.meter_i_r, r.meter_i_y, r.meter_i_b),
-      'Frequency (Hz)': isInvalid(r.meter_frequency) ? '' : Number(r.meter_frequency).toFixed(2),
-      'Temperature (C)': isInvalid(r.temperature) ? '' : Number(r.temperature).toFixed(1),
-      'Humidity (%)': isInvalid(r.humidity) ? '' : Number(r.humidity).toFixed(1),
-      'Fault Status': r.live_fault_status || r.fault_status || ''
+      'Meter Voltage R (V)': fmtNum(r.meter_v_r, 1),
+      'Meter Voltage Y (V)': fmtNum(r.meter_v_y, 1),
+      'Meter Voltage B (V)': fmtNum(r.meter_v_b, 1),
+      'Meter Current R (A)': fmtNum(r.meter_i_r, 2),
+      'Meter Current Y (A)': fmtNum(r.meter_i_y, 2),
+      'Meter Current B (A)': fmtNum(r.meter_i_b, 2),
+      'Relay Current I1 (A)': fmtNum(cur.i1, 2),
+      'Relay Current I2 (A)': fmtNum(cur.i2, 2),
+      'Relay Current I3 (A)': fmtNum(cur.i3, 2),
+      'Relay Current I0 Earth (A)': fmtNum(cur.i0, 2),
+      'Fault Status': faultStatus
     };
   });
 }
@@ -790,25 +937,27 @@ async function clearHistoricalData() {
 }
 
 /* ==========================================================================
-   NEW FEATURE: VIEW DETAILS MODAL
+   VIEW DETAILS MODAL (CHANGE 4)
    ==========================================================================
-   Opens a popup showing every field returned by GET /history for one
-   selected record. No new API call is made - the record already lives in
+   Opens a popup showing every value stored for the selected database
+   record. No new API call is made - the record already lives in
    `currentHistoricalRecords` (the same array the table and export use).
 
-   FIELD NAME NOTE:
-   The summary table only reads fields it already knows the exact PostgreSQL
-   column names for (panel_id, timestamp, meter_v_r, meter_frequency, etc.).
-   The extra detail fields requested for this popup (relay pickups, PF/Power
-   per phase, event info, fault record stages, etc.) were not previously
-   consumed anywhere in this codebase, so their exact column names in your
-   `/history` response are not yet confirmed here.
+   All field names below match the exact PostgreSQL column names returned
+   by GET /history in main.py (relay_i1, pickup_phase,
+   current_relay_status, relay_rtc, event_type, fault_status,
+   live_fault_status, historical_fault_status, operation_counter,
+   negative_sequence_current, thermal_level, fr_prestart_i1, etc.).
+   `pick()` is kept as a thin safety net in case a deployment uses
+   slightly different column names - it simply returns the first
+   candidate key that has a value.
 
-   To stay safe, `pick()` below tries a short list of the most likely column
-   name variants for each field (e.g. "relay_pickup_phase" or "pickup_phase")
-   and falls back to "--" if none match. If your actual API uses different
-   column names, just add them to the relevant candidate array - no other
-   code needs to change.
+   The "Relay Currents" section below now goes through the same
+   resolveRelayCurrents() resolver as the table/chart/exports, so it can
+   never disagree with them. The separate "Fault Record -> At Trip"
+   section further down intentionally reads fr_attrip_i1..i0 directly
+   (raw, unconditional) - it is unrelated to fault-flag resolution and is
+   preserved exactly as-is.
    ========================================================================== */
 
 // Tries each candidate key (in order) against a record and returns the
@@ -890,49 +1039,47 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
-// Builds and injects all 7 section cards for the given record
+// Builds and injects all section cards for the given record.
+// CHANGE 4 & 6: sections are grouped exactly as requested - Basic
+// Information, Meter Voltages, Meter Currents, Relay Currents, Relay
+// Settings, Fault Information, Environmental Data - plus the original
+// Event Information and Fault Record (Pre-start/At-Start/At-Trip) detail,
+// which are preserved (not removed) as additional sections.
 function renderRecordDetailsModal(r) {
   const modalBody = document.getElementById('modalBody');
   if (!modalBody) return;
 
   const dt = r.timestamp ? new Date(r.timestamp) : null;
   const validDt = dt && !isNaN(dt.getTime());
-  const fullTimestamp = validDt ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : (r.timestamp || '--');
+  const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '--');
+  const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '--') : '--');
 
   document.getElementById('modalTitle').innerText = `Record Details - Panel ${r.panel_id ?? '--'}`;
 
   let html = '';
 
-  // -------------------- SECTION 1: GENERAL INFORMATION --------------------
-  html += detailSectionHTML('fa-solid fa-circle-info', 'General Information',
+  // -------------------- SECTION: BASIC INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-circle-info', 'Basic Information',
+    detailFieldHTML('Date', fmtDetail(dateStr)) +
+    detailFieldHTML('Time', fmtDetail(timeStr)) +
     detailFieldHTML('Panel ID', fmtDetail(r.panel_id)) +
-    detailFieldHTML('Timestamp', fmtDetail(fullTimestamp)) +
-    detailFieldHTML('Relay Status', fmtDetail(pick(r, ['current_relay_status', 'relay_status'])))
-  );
-
-  // -------------------- SECTION 2: RELAY INFORMATION --------------------
-  html += detailSectionHTML('fa-solid fa-shield-halved', 'Relay Information',
-    detailFieldHTML('Relay I1', fmtDetail(pick(r, ['relay_i1']), 'A', 2)) +
-    detailFieldHTML('Relay I2', fmtDetail(pick(r, ['relay_i2']), 'A', 2)) +
-    detailFieldHTML('Relay I3', fmtDetail(pick(r, ['relay_i3']), 'A', 2)) +
-    detailFieldHTML('Relay I0', fmtDetail(pick(r, ['relay_i0']), 'A', 2)) +
-    detailFieldHTML('Pickup Phase', fmtDetail(pick(r, ['relay_pickup_phase', 'pickup_phase']), 'A', 2)) +
-    detailFieldHTML('Pickup Earth', fmtDetail(pick(r, ['relay_pickup_earth', 'pickup_earth']), 'A', 2)) +
-    detailFieldHTML('Operation Counter', fmtDetail(pick(r, ['relay_op_counter', 'op_counter']))) +
-    detailFieldHTML('Negative Sequence Current', fmtDetail(pick(r, ['relay_neg_seq', 'neg_seq']), 'A', 2)) +
-    detailFieldHTML('Thermal Level', fmtDetail(pick(r, ['relay_thermal_level', 'thermal_level']), '%')) +
+    detailFieldHTML('Relay Status', fmtDetail(pick(r, ['current_relay_status', 'relay_status']))) +
     detailFieldHTML('Relay RTC', fmtDetail(pick(r, ['relay_rtc', 'rtc'])))
   );
 
-  // -------------------- SECTION 3: POWER QUALITY METER --------------------
-  html += detailSectionHTML('fa-solid fa-gauge-high', 'Power Quality Meter',
+  // -------------------- SECTION: METER VOLTAGES --------------------
+  html += detailSectionHTML('fa-solid fa-car-battery', 'Meter Voltages',
     detailFieldHTML('Voltage R', fmtDetail(r.meter_v_r, 'V', 1)) +
     detailFieldHTML('Voltage Y', fmtDetail(r.meter_v_y, 'V', 1)) +
     detailFieldHTML('Voltage B', fmtDetail(r.meter_v_b, 'V', 1)) +
-    detailFieldHTML('Current R', fmtDetail(pick(r, ['meter_i_r']), 'A', 1)) +
-    detailFieldHTML('Current Y', fmtDetail(pick(r, ['meter_i_y']), 'A', 1)) +
-    detailFieldHTML('Current B', fmtDetail(pick(r, ['meter_i_b']), 'A', 1)) +
-    detailFieldHTML('Frequency', fmtDetail(r.meter_frequency, 'Hz', 2)) +
+    detailFieldHTML('Frequency', fmtDetail(r.meter_frequency, 'Hz', 2))
+  );
+
+  // -------------------- SECTION: METER CURRENTS --------------------
+  html += detailSectionHTML('fa-solid fa-bolt', 'Meter Currents',
+    detailFieldHTML('Current R', fmtDetail(pick(r, ['meter_i_r']), 'A', 2)) +
+    detailFieldHTML('Current Y', fmtDetail(pick(r, ['meter_i_y']), 'A', 2)) +
+    detailFieldHTML('Current B', fmtDetail(pick(r, ['meter_i_b']), 'A', 2)) +
     detailFieldHTML('PF - R', fmtDetail(pick(r, ['meter_pf_r']), '', 2)) +
     detailFieldHTML('PF - Y', fmtDetail(pick(r, ['meter_pf_y']), '', 2)) +
     detailFieldHTML('PF - B', fmtDetail(pick(r, ['meter_pf_b']), '', 2)) +
@@ -943,46 +1090,79 @@ function renderRecordDetailsModal(r) {
     detailFieldHTML('Total Power', fmtDetail(pick(r, ['meter_p_t']), 'kW', 2))
   );
 
-  // -------------------- SECTION 4: ENVIRONMENT --------------------
-  html += detailSectionHTML('fa-solid fa-cloud-sun-rain', 'Environment',
+  // -------------------- SECTION: RELAY CURRENTS --------------------
+  // Fault-aware: fr_attrip_* when overcurrent_fault/earth_fault is true,
+  // relay_* otherwise - via the same resolveRelayCurrents() resolver used
+  // by the table, the chart, and both exports (Requirement #3).
+  const curDetail = resolveRelayCurrents(r);
+  html += detailSectionHTML('fa-solid fa-shield-halved', 'Relay Currents',
+    detailFieldHTML('Relay I1', fmtDetail(curDetail.i1, 'A', 2)) +
+    detailFieldHTML('Relay I2', fmtDetail(curDetail.i2, 'A', 2)) +
+    detailFieldHTML('Relay I3', fmtDetail(curDetail.i3, 'A', 2)) +
+    detailFieldHTML('Relay I0 (Earth)', fmtDetail(curDetail.i0, 'A', 2))
+  );
+
+  // -------------------- SECTION: RELAY SETTINGS --------------------
+  html += detailSectionHTML('fa-solid fa-sliders', 'Relay Settings',
+    detailFieldHTML('Relay Pickup Phase', fmtDetail(pick(r, ['pickup_phase', 'relay_pickup_phase']), 'A', 2)) +
+    detailFieldHTML('Relay Pickup Earth', fmtDetail(pick(r, ['pickup_earth', 'relay_pickup_earth']), 'A', 2)) +
+    detailFieldHTML('Operation Counter', fmtDetail(pick(r, ['operation_counter', 'op_counter']))) +
+    detailFieldHTML('Negative Sequence Current', fmtDetail(pick(r, ['negative_sequence_current', 'neg_seq']), 'A', 2)) +
+    detailFieldHTML('Thermal Level', fmtDetail(pick(r, ['thermal_level']), '%'))
+  );
+
+  // -------------------- SECTION: FAULT INFORMATION --------------------
+  html += detailSectionHTML('fa-solid fa-triangle-exclamation', 'Fault Information',
+    detailFieldHTML('Fault Status', fmtDetail(pick(r, ['fault_status']))) +
+    detailFieldHTML('Live Fault Status', fmtDetail(pick(r, ['live_fault_status']))) +
+    detailFieldHTML('Historical Fault Status', fmtDetail(pick(r, ['historical_fault_status'])))
+  );
+
+  // -------------------- SECTION: ENVIRONMENTAL DATA --------------------
+  html += detailSectionHTML('fa-solid fa-cloud-sun-rain', 'Environmental Data',
     detailFieldHTML('Temperature', fmtDetail(r.temperature, '°C', 1)) +
     detailFieldHTML('Humidity', fmtDetail(r.humidity, '%', 1))
   );
 
-  // -------------------- SECTION 5: EVENT INFORMATION --------------------
+  // -------------------- SECTION: EVENT INFORMATION (preserved) --------------------
   html += detailSectionHTML('fa-solid fa-list-check', 'Event Information',
     detailFieldHTML('Event Type', fmtDetail(pick(r, ['event_type']))) +
     detailFieldHTML('Event Subtype', fmtDetail(pick(r, ['event_subtype']))) +
     detailFieldHTML('Event Timestamp', fmtDetail(pick(r, ['event_timestamp'])))
   );
 
-  // -------------------- SECTION 6: FAULT INFORMATION --------------------
-  html += detailSectionHTML('fa-solid fa-triangle-exclamation', 'Fault Information',
-    detailFieldHTML('Current Fault Status', fmtDetail(pick(r, ['current_fault_status', 'current_relay_status']))) +
-    detailFieldHTML('Live Fault Status', fmtDetail(pick(r, ['live_fault_status']))) +
-    detailFieldHTML('Historical Fault Status', fmtDetail(pick(r, ['historical_fault_status', 'fault_status'])))
-  );
-
-  // -------------------- SECTION 7: FAULT RECORD --------------------
+  // -------------------- SECTION: FAULT RECORD (preserved) --------------------
   const preStartFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_pre_start_i1', 'pre_start_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_pre_start_i2', 'pre_start_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_pre_start_i3', 'pre_start_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_pre_start_i0', 'pre_start_i0']), 'A', 2));
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_prestart_i1', 'fr_pre_start_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_prestart_i2', 'fr_pre_start_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_prestart_i3', 'fr_pre_start_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_prestart_i0', 'fr_pre_start_i0']), 'A', 2));
 
   const atStartFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_at_start_i1', 'at_start_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_at_start_i2', 'at_start_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_at_start_i3', 'at_start_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_at_start_i0', 'at_start_i0']), 'A', 2)) +
-    detailFieldHTML('Start Timestamp', fmtDetail(pick(r, ['fr_at_start_time', 'at_start_time'])));
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_atstart_i1', 'fr_at_start_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_atstart_i2', 'fr_at_start_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_atstart_i3', 'fr_at_start_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_atstart_i0', 'fr_at_start_i0']), 'A', 2)) +
+    detailFieldHTML('Start Timestamp', fmtDetail(pick(r, ['fr_atstart_timestamp', 'fr_at_start_time'])));
 
   const atTripFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_at_trip_i1', 'at_trip_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_at_trip_i2', 'at_trip_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_at_trip_i3', 'at_trip_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_at_trip_i0', 'at_trip_i0']), 'A', 2)) +
-    detailFieldHTML('Trip Timestamp', fmtDetail(pick(r, ['fr_at_trip_time', 'at_trip_time'])));
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_attrip_i1', 'fr_at_trip_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_attrip_i2', 'fr_at_trip_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_attrip_i3', 'fr_at_trip_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_attrip_i0', 'fr_at_trip_i0']), 'A', 2)) +
+    detailFieldHTML('Trip Timestamp', fmtDetail(pick(r, ['fr_attrip_timestamp', 'fr_at_trip_time'])));
+
+  const p80Fields =
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_p80_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_p80_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_p80_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_p80_i0']), 'A', 2));
+
+  const p200Fields =
+    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_p200_i1']), 'A', 2)) +
+    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_p200_i2']), 'A', 2)) +
+    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_p200_i3']), 'A', 2)) +
+    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_p200_i0']), 'A', 2));
 
   const faultRecordFields = `
     <div class="detail-subgroup">
@@ -996,6 +1176,14 @@ function renderRecordDetailsModal(r) {
     <div class="detail-subgroup trip-subgroup">
       <div class="detail-subgroup-title">At Trip</div>
       <div class="detail-fields-grid">${atTripFields}</div>
+    </div>
+    <div class="detail-subgroup">
+      <div class="detail-subgroup-title">+80% Post Trip</div>
+      <div class="detail-fields-grid">${p80Fields}</div>
+    </div>
+    <div class="detail-subgroup">
+      <div class="detail-subgroup-title">+200% Post Trip</div>
+      <div class="detail-fields-grid">${p200Fields}</div>
     </div>
   `;
 
@@ -1057,35 +1245,32 @@ function exportRecordPDF() {
 }
 
 // Flattens every field shown in the modal into one label -> value object,
-// reused by both single-record export functions above.
+// reused by both single-record export functions above. Relay currents go
+// through resolveRelayCurrents() so this single-record export matches the
+// table, the chart, and the bulk export exactly.
 function buildFullExportRow(r) {
   const dt = r.timestamp ? new Date(r.timestamp) : null;
   const validDt = dt && !isNaN(dt.getTime());
-  const fullTimestamp = validDt ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : (r.timestamp || '');
+  const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
+  const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
+
+  const cur = resolveRelayCurrents(r);
 
   return {
+    'Date': dateStr,
+    'Time': timeStr,
     'Panel ID': r.panel_id ?? '',
-    'Timestamp': fullTimestamp,
     'Relay Status': pick(r, ['current_relay_status', 'relay_status']) ?? '',
-
-    'Relay I1 (A)': pick(r, ['relay_i1']) ?? '',
-    'Relay I2 (A)': pick(r, ['relay_i2']) ?? '',
-    'Relay I3 (A)': pick(r, ['relay_i3']) ?? '',
-    'Relay I0 (A)': pick(r, ['relay_i0']) ?? '',
-    'Pickup Phase (A)': pick(r, ['relay_pickup_phase', 'pickup_phase']) ?? '',
-    'Pickup Earth (A)': pick(r, ['relay_pickup_earth', 'pickup_earth']) ?? '',
-    'Operation Counter': pick(r, ['relay_op_counter', 'op_counter']) ?? '',
-    'Negative Sequence Current (A)': pick(r, ['relay_neg_seq', 'neg_seq']) ?? '',
-    'Thermal Level (%)': pick(r, ['relay_thermal_level', 'thermal_level']) ?? '',
     'Relay RTC': pick(r, ['relay_rtc', 'rtc']) ?? '',
 
     'Voltage R (V)': r.meter_v_r ?? '',
     'Voltage Y (V)': r.meter_v_y ?? '',
     'Voltage B (V)': r.meter_v_b ?? '',
+    'Frequency (Hz)': r.meter_frequency ?? '',
+
     'Current R (A)': pick(r, ['meter_i_r']) ?? '',
     'Current Y (A)': pick(r, ['meter_i_y']) ?? '',
     'Current B (A)': pick(r, ['meter_i_b']) ?? '',
-    'Frequency (Hz)': r.meter_frequency ?? '',
     'PF-R': pick(r, ['meter_pf_r']) ?? '',
     'PF-Y': pick(r, ['meter_pf_y']) ?? '',
     'PF-B': pick(r, ['meter_pf_b']) ?? '',
@@ -1095,6 +1280,21 @@ function buildFullExportRow(r) {
     'Power B (kW)': pick(r, ['meter_p_b']) ?? '',
     'Total Power (kW)': pick(r, ['meter_p_t']) ?? '',
 
+    'Relay I1 (A)': cur.i1 ?? '',
+    'Relay I2 (A)': cur.i2 ?? '',
+    'Relay I3 (A)': cur.i3 ?? '',
+    'Relay I0 (A)': cur.i0 ?? '',
+
+    'Relay Pickup Phase (A)': pick(r, ['pickup_phase', 'relay_pickup_phase']) ?? '',
+    'Relay Pickup Earth (A)': pick(r, ['pickup_earth', 'relay_pickup_earth']) ?? '',
+    'Operation Counter': pick(r, ['operation_counter', 'op_counter']) ?? '',
+    'Negative Sequence Current (A)': pick(r, ['negative_sequence_current', 'neg_seq']) ?? '',
+    'Thermal Level (%)': pick(r, ['thermal_level']) ?? '',
+
+    'Fault Status': pick(r, ['fault_status']) ?? '',
+    'Live Fault Status': pick(r, ['live_fault_status']) ?? '',
+    'Historical Fault Status': pick(r, ['historical_fault_status']) ?? '',
+
     'Temperature (C)': r.temperature ?? '',
     'Humidity (%)': r.humidity ?? '',
 
@@ -1102,25 +1302,31 @@ function buildFullExportRow(r) {
     'Event Subtype': pick(r, ['event_subtype']) ?? '',
     'Event Timestamp': pick(r, ['event_timestamp']) ?? '',
 
-    'Current Fault Status': pick(r, ['current_fault_status', 'current_relay_status']) ?? '',
-    'Live Fault Status': pick(r, ['live_fault_status']) ?? '',
-    'Historical Fault Status': pick(r, ['historical_fault_status', 'fault_status']) ?? '',
+    'Fault Record Pre-Start I1 (A)': pick(r, ['fr_prestart_i1']) ?? '',
+    'Fault Record Pre-Start I2 (A)': pick(r, ['fr_prestart_i2']) ?? '',
+    'Fault Record Pre-Start I3 (A)': pick(r, ['fr_prestart_i3']) ?? '',
+    'Fault Record Pre-Start I0 (A)': pick(r, ['fr_prestart_i0']) ?? '',
 
-    'Fault Record Pre-Start I1 (A)': pick(r, ['fr_pre_start_i1', 'pre_start_i1']) ?? '',
-    'Fault Record Pre-Start I2 (A)': pick(r, ['fr_pre_start_i2', 'pre_start_i2']) ?? '',
-    'Fault Record Pre-Start I3 (A)': pick(r, ['fr_pre_start_i3', 'pre_start_i3']) ?? '',
-    'Fault Record Pre-Start I0 (A)': pick(r, ['fr_pre_start_i0', 'pre_start_i0']) ?? '',
+    'Fault Record At-Start I1 (A)': pick(r, ['fr_atstart_i1']) ?? '',
+    'Fault Record At-Start I2 (A)': pick(r, ['fr_atstart_i2']) ?? '',
+    'Fault Record At-Start I3 (A)': pick(r, ['fr_atstart_i3']) ?? '',
+    'Fault Record At-Start I0 (A)': pick(r, ['fr_atstart_i0']) ?? '',
+    'Fault Record Start Timestamp': pick(r, ['fr_atstart_timestamp']) ?? '',
 
-    'Fault Record At-Start I1 (A)': pick(r, ['fr_at_start_i1', 'at_start_i1']) ?? '',
-    'Fault Record At-Start I2 (A)': pick(r, ['fr_at_start_i2', 'at_start_i2']) ?? '',
-    'Fault Record At-Start I3 (A)': pick(r, ['fr_at_start_i3', 'at_start_i3']) ?? '',
-    'Fault Record At-Start I0 (A)': pick(r, ['fr_at_start_i0', 'at_start_i0']) ?? '',
-    'Fault Record Start Timestamp': pick(r, ['fr_at_start_time', 'at_start_time']) ?? '',
+    'Fault Record At-Trip I1 (A)': pick(r, ['fr_attrip_i1']) ?? '',
+    'Fault Record At-Trip I2 (A)': pick(r, ['fr_attrip_i2']) ?? '',
+    'Fault Record At-Trip I3 (A)': pick(r, ['fr_attrip_i3']) ?? '',
+    'Fault Record At-Trip I0 (A)': pick(r, ['fr_attrip_i0']) ?? '',
+    'Fault Record Trip Timestamp': pick(r, ['fr_attrip_timestamp']) ?? '',
 
-    'Fault Record At-Trip I1 (A)': pick(r, ['fr_at_trip_i1', 'at_trip_i1']) ?? '',
-    'Fault Record At-Trip I2 (A)': pick(r, ['fr_at_trip_i2', 'at_trip_i2']) ?? '',
-    'Fault Record At-Trip I3 (A)': pick(r, ['fr_at_trip_i3', 'at_trip_i3']) ?? '',
-    'Fault Record At-Trip I0 (A)': pick(r, ['fr_at_trip_i0', 'at_trip_i0']) ?? '',
-    'Fault Record Trip Timestamp': pick(r, ['fr_at_trip_time', 'at_trip_time']) ?? ''
+    'Fault Record +80% I1 (A)': pick(r, ['fr_p80_i1']) ?? '',
+    'Fault Record +80% I2 (A)': pick(r, ['fr_p80_i2']) ?? '',
+    'Fault Record +80% I3 (A)': pick(r, ['fr_p80_i3']) ?? '',
+    'Fault Record +80% I0 (A)': pick(r, ['fr_p80_i0']) ?? '',
+
+    'Fault Record +200% I1 (A)': pick(r, ['fr_p200_i1']) ?? '',
+    'Fault Record +200% I2 (A)': pick(r, ['fr_p200_i2']) ?? '',
+    'Fault Record +200% I3 (A)': pick(r, ['fr_p200_i3']) ?? '',
+    'Fault Record +200% I0 (A)': pick(r, ['fr_p200_i0']) ?? ''
   };
 }

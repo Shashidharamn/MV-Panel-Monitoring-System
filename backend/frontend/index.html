@@ -199,6 +199,11 @@
       </div>
 
       <!-- Fault Condition Diagnosis -->
+      <!-- Live Fault Status is fully re-derived from ONLY the latest polled
+           record on every polling cycle inside processTelemetryData() in
+           app.js. The banner/icon/text are fully reset and reassigned every
+           cycle so a healed relay immediately shows "No Fault Detected"
+           instead of a stale fault. -->
       <div class="sub-panel fault-diagnosis-panel" id="faultDiagPanel">
         <div class="panel-subtitle"><i class="fa-solid fa-triangle-exclamation"></i> Live Fault Status</div>
         <div class="fault-summary-banner healthy" id="faultSummaryBanner">
@@ -429,32 +434,45 @@
         </div>
 
         <!-- Actions -->
+        <!-- Layout: Search | Refresh | Show Live Chart, with Clear Data
+             spanning the full row below (unchanged). -->
         <div class="hist-action-buttons">
           <button class="action-btn filter-btn" onclick="fetchHistoricalData()"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+          <button class="action-btn refresh-btn" onclick="refreshHistoricalData()"><i class="fa-solid fa-rotate"></i> Refresh</button>
           <button class="action-btn reset-btn" id="resetLiveBtn" onclick="resetToLiveChart()" disabled><i class="fa-solid fa-play"></i> Show Live Chart</button>
           <button class="action-btn clear-btn" onclick="clearHistoricalData()" style="grid-column: 1 / -1;"><i class="fa-solid fa-trash-can"></i> Clear Data</button>
         </div>
       </div>
 
       <!-- Historical Records Table -->
+      <!-- Table shows the exact stored PostgreSQL values (Meter Voltage
+           R/Y/B, Meter Current R/Y/B, Relay Current I1/I2/I3/I0) as
+           resolved by the backend - during an active Overcurrent or Earth
+           fault these Relay Current columns are the relay's own At-Trip
+           fault-record snapshot, not the live reading. Each row's own
+           Fault Status column is driven purely by that row's record. -->
       <div class="sub-panel" style="margin-top: 16px;">
         <div class="panel-subtitle"><i class="fa-solid fa-table"></i> Historical Records</div>
         <p id="historyMessage" style="color: var(--text-muted); font-size: 0.85rem; padding: 6px 0 10px;">Select a date range and click Search to view historical records.</p>
         <div id="historyTableWrapper" class="hidden" style="overflow-x: auto;">
-          <table class="meter-table" id="historyTable">
+          <table class="meter-table hist-table" id="historyTable">
             <thead>
               <tr>
                 <th>Date</th>
                 <th>Time</th>
                 <th>Panel ID</th>
-                <th>Relay Status</th>
-                <th>Voltage</th>
-                <th>Current</th>
-                <th>Frequency</th>
-                <th>Temperature</th>
-                <th>Humidity</th>
+                <th>Meter Voltage R</th>
+                <th>Meter Voltage Y</th>
+                <th>Meter Voltage B</th>
+                <th>Meter Current R</th>
+                <th>Meter Current Y</th>
+                <th>Meter Current B</th>
+                <th>Relay Current I1</th>
+                <th>Relay Current I2</th>
+                <th>Relay Current I3</th>
+                <th>Relay Current I0 (Earth)</th>
                 <th>Fault Status</th>
-                <th>Action</th>
+                <th>View Details</th>
               </tr>
             </thead>
             <tbody id="historyTableBody">
@@ -492,6 +510,10 @@
        RECORD DETAILS MODAL (View Details feature)
        Populated entirely from the record data already returned by GET /history.
        No extra API calls are made when this modal is opened.
+       Modal content is grouped into clearly labeled sections (Basic
+       Information, Meter Voltages, Meter Currents, Relay Currents, Relay
+       Settings, Fault Information, Environmental Data) - see
+       renderRecordDetailsModal() in app.js. Layout/design is unchanged.
        ========================================================================== -->
   <div id="recordDetailsOverlay" class="modal-overlay hidden">
     <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
