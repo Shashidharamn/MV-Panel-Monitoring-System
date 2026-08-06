@@ -544,23 +544,21 @@ def row_to_dict(row, timestamp_as_string=False):
 
 
 # =============================================================================
-# FAULT-AWARE RELAY CURRENT / STATUS RESOLUTION
+# FAULT STATUS DERIVATION
 #
 # Single source of truth used by BOTH /latest and /history so the live
 # dashboard, the historical table, the historical chart, and the exports
-# can never disagree with each other.
+# can never disagree with each other on fault WORDING.
 #
-# Why this is needed: the relay's raw "live" current readings
-# (relay_i1/i2/i3/i0) reflect whatever the CT is measuring at THIS instant.
-# The moment a breaker trips open on an Overcurrent or Earth fault, that
-# live reading collapses (e.g. to ~0A or some partial residual value) even
-# though the fault event itself happened at a specific, higher current.
-# The relay separately stores that real trip-moment snapshot in its
-# "At Trip" fault record (fr_attrip_i1/i2/i3/i0), which does NOT change
-# on every poll - it only updates on the next trip. So whenever a record
-# reports an active fault, we display the At-Trip snapshot instead of the
-# live reading. Once the fault clears, later records go back to reporting
-# genuine live current, unaffected by anything shown previously.
+# NOTE ON RELAY CURRENTS: relay_i1/i2/i3/i0 are ALWAYS the genuine live
+# relay readings, everywhere in this API (/latest and /history alike).
+# They are never substituted with the fault record's "At Trip" snapshot
+# by the backend. The relay separately stores the real trip-moment
+# snapshot in fr_attrip_i1/i2/i3/i0, which is returned unconditionally as
+# its own field on every record/row - it is up to each consumer of the
+# API to decide where the At-Trip snapshot should be displayed instead of
+# the live reading (that decision belongs to the frontend's Historical
+# Records module only; see resolveRelayCurrents() in app.js).
 # =============================================================================
 
 # -----------------------------------------------------------------------
@@ -628,33 +626,6 @@ def derive_fault_status(overcurrent_fault, earth_fault, event_type=None, event_s
     return "No Fault Detected"
 
 
-def effective_relay_currents(flat: dict) -> Tuple[float, float, float, float]:
-    """
-    Returns the (i1, i2, i3, i0) values that should be DISPLAYED for a
-    given record.
-
-    - If this record shows an active Overcurrent or Earth fault, the
-      relay's own "At Trip" fault-record values are used - this is the
-      real current present at the moment of the trip, and it is never
-      later swapped out for a subsequent live reading.
-    - Otherwise, the genuine live relay readings are returned unchanged,
-      so normal day-to-day monitoring is unaffected.
-    """
-    if flat.get("overcurrent_fault") or flat.get("earth_fault"):
-        return (
-            flat["fr_attrip_i1"],
-            flat["fr_attrip_i2"],
-            flat["fr_attrip_i3"],
-            flat["fr_attrip_i0"],
-        )
-    return (
-        flat["relay_i1"],
-        flat["relay_i2"],
-        flat["relay_i3"],
-        flat["relay_i0"],
-    )
-
-
 # -----------------------------
 # Get Latest Sensor Data
 # -----------------------------
@@ -682,11 +653,9 @@ LIMIT 1;
 
     flat = row_to_dict(row, timestamp_as_string=False)
 
-    # Resolve the currents/fault status to display using the shared,
-    # fault-aware logic (see effective_relay_currents / derive_fault_status
-    # above) so an active Overcurrent/Earth fault shows the relay's real
-    # At-Trip current instead of a misleading post-trip live reading.
-    disp_i1, disp_i2, disp_i3, disp_i0 = effective_relay_currents(flat)
+    # Live Dashboard: fault status text is derived fresh from ONLY this
+    # latest row (never carried over from a previous poll), so it clears
+    # to "No Fault Detected" immediately once the fault flags go false.
     fault_status_text = derive_fault_status(
         flat["overcurrent_fault"],
         flat["earth_fault"],
@@ -702,10 +671,13 @@ LIMIT 1;
             "sg_active": 1,
             "pickup_phase": flat["pickup_phase"],
             "pickup_earth": flat["pickup_earth"],
-            "i1": disp_i1,
-            "i2": disp_i2,
-            "i3": disp_i3,
-            "i0": disp_i0,
+            # Live Dashboard relay currents are ALWAYS the genuine live
+            # relay_i1..i0 readings - never substituted with the At-Trip
+            # fault-record snapshot, even while a fault is active.
+            "i1": flat["relay_i1"],
+            "i2": flat["relay_i2"],
+            "i3": flat["relay_i3"],
+            "i0": flat["relay_i0"],
             "op_counter": flat["operation_counter"],
             "neg_seq": flat["negative_sequence_current"],
             "thermal_level": flat["thermal_level"],
@@ -894,19 +866,19 @@ def get_history(
     if not rows:
         return []
 
-    # Every historical record is resolved through the same fault-aware
-    # logic used by /latest: while that record shows an active Overcurrent
-    # or Earth fault, its relay currents come from the relay's own At-Trip
-    # fault record (a permanent snapshot), never from the live reading.
-    # This is what makes the historical log a true, unchanging record of
-    # what actually happened at trip time, even long after the fault
-    # clears and live current returns to normal.
+    # Each historical row carries its OWN genuine relay_i1..i0 live
+    # reading AND its own fr_attrip_i1..i0 At-Trip snapshot, both
+    # returned unconditionally, exactly as stored. The API does not
+    # decide which one to display - that fault-aware choice (fr_attrip_*
+    # on a faulted row, relay_* otherwise) belongs solely to the
+    # Historical Records module on the frontend (table/chart/exports),
+    # via resolveRelayCurrents() in app.js. This keeps relay_i1..i0
+    # meaning the same thing everywhere in the API: the true live
+    # reading for that row, which is what the View Details -> "Relay
+    # Currents" section needs.
     history = []
     for row in rows:
         rec = row_to_dict(row, timestamp_as_string=True)
-
-        i1, i2, i3, i0 = effective_relay_currents(rec)
-        rec["relay_i1"], rec["relay_i2"], rec["relay_i3"], rec["relay_i0"] = i1, i2, i3, i0
 
         status_text = derive_fault_status(
             rec["overcurrent_fault"],

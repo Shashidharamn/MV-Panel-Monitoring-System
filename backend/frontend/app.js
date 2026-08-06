@@ -55,20 +55,32 @@ function isActiveFault(faultStatusText) {
 }
 
 // -----------------------------------------------------------------------
-// Fault-aware relay current resolver (frontend safety net).
+// Fault-aware relay current resolver.
 //
-// The backend (/history in main.py) already resolves relay_i1..i0 to the
-// relay's "At Trip" fault-record snapshot whenever overcurrent_fault or
-// earth_fault is true on that row. This function mirrors that exact same
-// rule on the frontend, so every historical display - the table, the
-// chart, both bulk exports, the single-record exports, and the View
-// Details "Relay Currents" section - reads through ONE shared resolver
-// instead of each place picking its own field. That guarantees they can
-// never disagree with each other or with the View Details -> Fault
-// Record -> At Trip values, regardless of what the API happens to send
-// for relay_i1..i0 on a given row.
+// IMPORTANT - SCOPE: this resolver is used by every part of the app that
+// displays a HISTORICAL row's relay current: the Historical Records
+// table, the historical chart, the bulk history export, the View
+// Details -> "Relay Currents" section, and the single-record export
+// (which mirrors that modal section). Using the same resolver in all of
+// these guarantees they can never disagree with each other for a given
+// row.
 //
-//   If overcurrent_fault or earth_fault is true:
+// It must NEVER be used for the Live Dashboard - relay.i1/i2/i3/i0 from
+// /latest are always the genuine live relay readings and must be shown
+// as-is, regardless of fault state.
+//
+// It is also NOT used by the View Details -> "Fault Record" section,
+// which intentionally reads fr_attrip_* (and fr_prestart_*/fr_atstart_*/
+// fr_p80_*/fr_p200_*) directly and unconditionally - that section is the
+// relay's permanent record of the trip event itself, independent of
+// which value this resolver chooses to show in "Relay Currents".
+//
+// The backend (/history in main.py) does NOT pre-resolve relay_i1..i0 -
+// it always returns the raw relay reading for that row, plus the row's
+// own fr_attrip_* fields, unconditionally. This function is what applies
+// the "use fr_attrip_* on a faulted row" rule on the frontend:
+//
+//   If overcurrent_fault or earth_fault is true (for THIS row only):
 //     use fr_attrip_i1 / fr_attrip_i2 / fr_attrip_i3 / fr_attrip_i0
 //   Otherwise:
 //     use relay_i1 / relay_i2 / relay_i3 / relay_i0
@@ -216,12 +228,11 @@ async function fetchLatestData() {
 /* ==========================================================================
    Telemetry Processing & UI Updates (Live Monitoring - unchanged)
 
-   NOTE ON RELAY CURRENTS: relay.i1/i2/i3/i0 arrive ALREADY RESOLVED by the
-   backend (/latest) - while an Overcurrent or Earth fault is active on the
-   latest record, these values are the relay's own "At Trip" fault-record
-   snapshot rather than the raw live reading, so this section never needs to
-   choose between the two itself. Once the fault clears on a later poll,
-   the backend automatically resumes sending genuine live current.
+   NOTE ON RELAY CURRENTS: relay.i1/i2/i3/i0 arrive from the backend
+   (/latest) as the GENUINE LIVE relay readings, always - the backend never
+   substitutes them with the fault record's "At Trip" snapshot, even while
+   an Overcurrent or Earth fault is active. This section displays them
+   as-is; it never needs to choose between live and At-Trip values itself.
    ========================================================================== */
 function processTelemetryData(data) {
   updateTimestamp();
@@ -555,9 +566,11 @@ function pushChartBuffer(i1, i2, i3, i0, vr, vy, vb, temp, hum) {
    NOTE ON RELAY CURRENTS: every read of relay current in this module goes
    through resolveRelayCurrents(record) (defined near the top of this file)
    instead of reading r.relay_i1/i2/i3/i0 directly. That guarantees the
-   table, the chart, both exports, and View Details -> Relay Currents can
-   never disagree with each other, or with View Details -> Fault Record ->
-   At Trip, regardless of what the API sends for relay_i1..i0 on a row.
+   table, the chart, both bulk/single-record exports, and the View
+   Details -> "Relay Currents" section can never disagree with each
+   other. This resolver is never used for the Live Dashboard, which
+   always shows the genuine live relay_i1..i0 reading regardless of
+   fault state.
    ========================================================================== */
 
 // Small numeric helpers used by table rendering, chart plotting and export
@@ -725,6 +738,7 @@ function renderHistoricalTable(records) {
 
     // Fault-aware relay currents - fr_attrip_* on a faulted row, live
     // relay_* otherwise. Same resolver used by the chart and both exports.
+    // (Historical Records module only - see resolveRelayCurrents() note.)
     const cur = resolveRelayCurrents(r);
 
     row.innerHTML = `
@@ -819,6 +833,7 @@ function buildExportRows(records) {
     const rawFault = r.live_fault_status || r.historical_fault_status || r.fault_status;
     const faultStatus = (rawFault && String(rawFault).trim()) ? String(rawFault).trim() : 'No Fault Detected';
 
+    // Historical Records module - fault-aware resolver applies here.
     const cur = resolveRelayCurrents(r);
 
     return {
@@ -952,12 +967,13 @@ async function clearHistoricalData() {
    slightly different column names - it simply returns the first
    candidate key that has a value.
 
-   The "Relay Currents" section below now goes through the same
-   resolveRelayCurrents() resolver as the table/chart/exports, so it can
-   never disagree with them. The separate "Fault Record -> At Trip"
-   section further down intentionally reads fr_attrip_i1..i0 directly
-   (raw, unconditional) - it is unrelated to fault-flag resolution and is
-   preserved exactly as-is.
+   The "Relay Currents" section below follows the SAME fault-aware logic
+   as the Historical Records table/chart (via resolveRelayCurrents()):
+   fr_attrip_* on a row where overcurrent_fault or earth_fault is true,
+   relay_* otherwise. The separate "Fault Record -> At Trip" section
+   further down intentionally reads fr_attrip_i1..i0 directly (raw,
+   unconditional, regardless of fault flags) - it is the relay's
+   permanent trip-event record and is preserved exactly as-is.
    ========================================================================== */
 
 // Tries each candidate key (in order) against a record and returns the
@@ -1091,15 +1107,20 @@ function renderRecordDetailsModal(r) {
   );
 
   // -------------------- SECTION: RELAY CURRENTS --------------------
-  // Fault-aware: fr_attrip_* when overcurrent_fault/earth_fault is true,
-  // relay_* otherwise - via the same resolveRelayCurrents() resolver used
-  // by the table, the chart, and both exports (Requirement #3).
-  const curDetail = resolveRelayCurrents(r);
+  // Same fault-aware logic as the Historical Records table/chart: on a
+  // faulted row (overcurrent_fault or earth_fault true) this shows the
+  // relay's At-Trip snapshot (fr_attrip_*); on a normal row it shows the
+  // genuine relay_i1..i0 reading. Uses the SAME resolveRelayCurrents()
+  // resolver as the table, so it can never disagree with it. The
+  // separate "Fault Record" section further below always shows the raw
+  // fr_attrip_* (and pre-start/at-start/+80%/+200%) values unconditionally,
+  // regardless of this section.
+  const relayCurDetail = resolveRelayCurrents(r);
   html += detailSectionHTML('fa-solid fa-shield-halved', 'Relay Currents',
-    detailFieldHTML('Relay I1', fmtDetail(curDetail.i1, 'A', 2)) +
-    detailFieldHTML('Relay I2', fmtDetail(curDetail.i2, 'A', 2)) +
-    detailFieldHTML('Relay I3', fmtDetail(curDetail.i3, 'A', 2)) +
-    detailFieldHTML('Relay I0 (Earth)', fmtDetail(curDetail.i0, 'A', 2))
+    detailFieldHTML('Relay I1', fmtDetail(relayCurDetail.i1, 'A', 2)) +
+    detailFieldHTML('Relay I2', fmtDetail(relayCurDetail.i2, 'A', 2)) +
+    detailFieldHTML('Relay I3', fmtDetail(relayCurDetail.i3, 'A', 2)) +
+    detailFieldHTML('Relay I0 (Earth)', fmtDetail(relayCurDetail.i0, 'A', 2))
   );
 
   // -------------------- SECTION: RELAY SETTINGS --------------------
@@ -1245,15 +1266,21 @@ function exportRecordPDF() {
 }
 
 // Flattens every field shown in the modal into one label -> value object,
-// reused by both single-record export functions above. Relay currents go
-// through resolveRelayCurrents() so this single-record export matches the
-// table, the chart, and the bulk export exactly.
+// reused by both single-record export functions above. This mirrors the
+// modal exactly: "Relay Currents" here is the genuine relay_i1..i0 (never
+// At-Trip substituted), and the separate Fault Record fields below it
+// carry the fr_attrip_* / fr_prestart_* / etc. values unconditionally.
 function buildFullExportRow(r) {
   const dt = r.timestamp ? new Date(r.timestamp) : null;
   const validDt = dt && !isNaN(dt.getTime());
   const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
   const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
 
+  // Matches the "Relay Currents" modal section - same fault-aware
+  // resolveRelayCurrents() logic as the Historical Records table/chart
+  // (fr_attrip_* on a faulted row, relay_* otherwise). The separate
+  // Fault Record fields further below always carry the raw fr_attrip_*
+  // values unconditionally, regardless of this section.
   const cur = resolveRelayCurrents(r);
 
   return {
