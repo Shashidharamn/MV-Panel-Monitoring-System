@@ -34,6 +34,78 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         content={"detail": f"Unexpected server error: {str(exc)}"},
     )
 
+# ==========================================
+# CUSTOMER LOGIN
+# ==========================================
+
+from pydantic import BaseModel
+
+
+class CustomerLogin(BaseModel):
+    customer_id: str
+
+
+@app.post("/login")
+def customer_login(data: CustomerLogin):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT customer_id
+        FROM customers
+        WHERE customer_id = %s
+    """, (data.customer_id,))
+
+    customer = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    if not customer:
+        return {
+            "status": "error",
+            "message": "Invalid Customer ID"
+        }
+
+    return {
+        "status": "success",
+        "customer_id": customer[0]
+    }
+
+# ==========================================
+# GET CUSTOMER PANELS
+# ==========================================
+
+@app.get("/customer/panels")
+def get_customer_panels(customer_id: str):
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT panel_id
+        FROM customer_panels
+        WHERE customer_id = %s
+        ORDER BY panel_id
+    """, (customer_id,))
+
+    rows = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    if not rows:
+        return {
+            "status": "error",
+            "message": "No panels assigned to this customer"
+        }
+
+    return {
+        "status": "success",
+        "customer_id": customer_id,
+        "panels": [row[0] for row in rows]
+    }
 
 # -----------------------------
 # Data Model
@@ -630,18 +702,28 @@ def derive_fault_status(overcurrent_fault, earth_fault, event_type=None, event_s
 # Get Latest Sensor Data
 # -----------------------------
 @app.get("/latest")
-def latest_data():
+def latest_data(panel_id: Optional[str] = Query(None)):
 
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute(f"""
-        SELECT
+    if panel_id:
+        cursor.execute(f"""
+            SELECT
 {SENSOR_COLUMNS}
-FROM sensor_data
-ORDER BY id DESC
-LIMIT 1;
-    """)
+            FROM sensor_data
+            WHERE panel_id = %s
+            ORDER BY id DESC
+            LIMIT 1;
+        """, (panel_id,))
+    else:
+        cursor.execute(f"""
+            SELECT
+{SENSOR_COLUMNS}
+            FROM sensor_data
+            ORDER BY id DESC
+            LIMIT 1;
+        """)
 
     row = cursor.fetchone()
 
@@ -652,6 +734,7 @@ LIMIT 1;
         return {"message": "No Data Available"}
 
     flat = row_to_dict(row, timestamp_as_string=False)
+
 
     # Live Dashboard: fault status text is derived fresh from ONLY this
     # latest row (never carried over from a previous poll), so it clears
