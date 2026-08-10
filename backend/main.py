@@ -38,9 +38,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # CUSTOMER LOGIN
 # ==========================================
 
-from pydantic import BaseModel
-
-
 class CustomerLogin(BaseModel):
     customer_id: str
 
@@ -146,11 +143,6 @@ class SensorData(BaseModel):
 
     temperature: float
     humidity: float
-
-    # -----------------------------
-    # NEW: additional relay telemetry fields sent by the updated ESP32
-    # firmware. All fields above this point are unchanged.
-    # -----------------------------
 
     relay_rtc: str
 
@@ -428,13 +420,6 @@ VALUES
     }
 
 
-# -----------------------------
-# Shared column list used by /latest and /history so both endpoints stay
-# in sync and the row-index -> field mapping below (row_to_dict) always
-# lines up. The first 28 columns are in EXACTLY the same order as the
-# original query, so nothing that depended on that ordering changes.
-# All new columns are appended after "timestamp".
-# -----------------------------
 SENSOR_COLUMNS = """
     id,
     panel_id,
@@ -521,12 +506,6 @@ SENSOR_COLUMNS = """
 
 
 def row_to_dict(row, timestamp_as_string=False):
-    """
-    Maps a row (matching SENSOR_COLUMNS order above) to the response
-    dict. All the original /latest and /history fields and their names
-    are preserved exactly; new fields are appended after "timestamp",
-    exactly like the new DB columns.
-    """
     ts = row[27].strftime("%Y-%m-%d %H:%M:%S") if timestamp_as_string else row[27]
 
     return {
@@ -615,80 +594,16 @@ def row_to_dict(row, timestamp_as_string=False):
     }
 
 
-# =============================================================================
-# FAULT STATUS DERIVATION
-#
-# Single source of truth used by BOTH /latest and /history so the live
-# dashboard, the historical table, the historical chart, and the exports
-# can never disagree with each other on fault WORDING.
-#
-# NOTE ON RELAY CURRENTS: relay_i1/i2/i3/i0 are ALWAYS the genuine live
-# relay readings, everywhere in this API (/latest and /history alike).
-# They are never substituted with the fault record's "At Trip" snapshot
-# by the backend. The relay separately stores the real trip-moment
-# snapshot in fr_attrip_i1/i2/i3/i0, which is returned unconditionally as
-# its own field on every record/row - it is up to each consumer of the
-# API to decide where the At-Trip snapshot should be displayed instead of
-# the live reading (that decision belongs to the frontend's Historical
-# Records module only; see resolveRelayCurrents() in app.js).
-# =============================================================================
-
-# -----------------------------------------------------------------------
-# Event-type codes used ONLY to disambiguate the rare case where the
-# relay reports BOTH overcurrent_fault and earth_fault true on the same
-# record. event_type / event_subtype are the relay's own record of which
-# protection stage actually operated, so they're more trustworthy than
-# guessing from the two booleans alone.
-#
-# NOT YET CONFIGURED: these sets must be populated with the exact
-# event_type (and/or event_subtype) values from the REJ601's own
-# event/disturbance-record code table for "Earth fault protection
-# operated" and "Overcurrent protection operated". That table isn't
-# part of main.py or anything supplied so far - leaving these empty
-# rather than guessing numbers, since a wrong guess would silently
-# misclassify faults again, just through a different path. Until these
-# are filled in, the ambiguous both-true case falls back to Earth Fault
-# (see comment in derive_fault_status below).
-# -----------------------------------------------------------------------
-EARTH_FAULT_EVENT_TYPES: set = set()   # TODO: fill in from REJ601 event code table
-OVERCURRENT_EVENT_TYPES: set = set()   # TODO: fill in from REJ601 event code table
+EARTH_FAULT_EVENT_TYPES: set = set()
+OVERCURRENT_EVENT_TYPES: set = set()
 
 
 def derive_fault_status(overcurrent_fault, earth_fault, event_type=None, event_subtype=None) -> str:
-    """
-    Canonical, consistently-worded fault status text for a record. This is
-    the ONLY place in the entire application (backend or frontend) where
-    fault message text is defined. Every caller (fault_status,
-    live_fault_status, historical_fault_status, fault_record1.at_trip_status)
-    passes the SAME overcurrent_fault / earth_fault / event_type /
-    event_subtype for that record and gets back this same string - that's
-    what guarantees the three fault fields can never disagree for a given
-    record, and that the message wording is identical everywhere it's
-    displayed (Historical Records table, chart, exports, View Details, and
-    the live dashboard banner).
-
-    Exactly three possible return values (standardized wording - do not
-    introduce any other phrasing anywhere else in the codebase):
-      - "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
-      - "Fault Detected - E/F (Single Line Earth Fault Current)"
-      - "No Fault Detected"
-
-    - If only one of overcurrent_fault / earth_fault is true, that's
-      unambiguous and used directly.
-    - If BOTH are true at once, the booleans alone can't tell you which
-      one actually operated, so event_type / event_subtype (the relay's
-      own event record) is used to decide instead of blindly prioritizing
-      one flag. See EARTH_FAULT_EVENT_TYPES / OVERCURRENT_EVENT_TYPES
-      above - until those are populated with real REJ601 codes, this
-      falls back to Earth Fault as the higher-consequence condition to
-      surface, rather than silently defaulting to Overcurrent.
-    """
     if overcurrent_fault and earth_fault:
         if event_type in EARTH_FAULT_EVENT_TYPES or event_subtype in EARTH_FAULT_EVENT_TYPES:
             return "Fault Detected - E/F (Single Line Earth Fault Current)"
         if event_type in OVERCURRENT_EVENT_TYPES or event_subtype in OVERCURRENT_EVENT_TYPES:
             return "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
-        # Ambiguous, or event code tables above not configured yet.
         return "Fault Detected - E/F (Single Line Earth Fault Current)"
 
     if earth_fault:
@@ -735,10 +650,6 @@ def latest_data(panel_id: Optional[str] = Query(None)):
 
     flat = row_to_dict(row, timestamp_as_string=False)
 
-
-    # Live Dashboard: fault status text is derived fresh from ONLY this
-    # latest row (never carried over from a previous poll), so it clears
-    # to "No Fault Detected" immediately once the fault flags go false.
     fault_status_text = derive_fault_status(
         flat["overcurrent_fault"],
         flat["earth_fault"],
@@ -754,9 +665,6 @@ def latest_data(panel_id: Optional[str] = Query(None)):
             "sg_active": 1,
             "pickup_phase": flat["pickup_phase"],
             "pickup_earth": flat["pickup_earth"],
-            # Live Dashboard relay currents are ALWAYS the genuine live
-            # relay_i1..i0 readings - never substituted with the At-Trip
-            # fault-record snapshot, even while a fault is active.
             "i1": flat["relay_i1"],
             "i2": flat["relay_i2"],
             "i3": flat["relay_i3"],
@@ -819,19 +727,6 @@ def latest_data(panel_id: Optional[str] = Query(None)):
     }
 
 
-# =============================================================================
-# HISTORICAL DATA MODULE HELPERS
-#
-# These two functions are shared by GET /history and DELETE /history so the
-# validation and WHERE-clause logic can never drift apart between the two
-# endpoints. Both raise HTTPException(400) directly on bad input, so callers
-# should invoke them *outside* any try/except that translates errors to 500 -
-# that's exactly how get_history/delete_history below are structured.
-# =============================================================================
-
-# Accepted input formats. HTML <input type="datetime-local"> sends
-# "YYYY-MM-DDTHH:MM" (no seconds, 'T' separator) - that's normalized to a
-# space before matching, so it's covered by the "%Y-%m-%d %H:%M" format.
 _DATETIME_FORMATS = (
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d %H:%M",
@@ -840,19 +735,6 @@ _DATETIME_FORMATS = (
 
 
 def _parse_datetime(value: Optional[str], field_name: str) -> datetime:
-    """
-    Parses a date/time string into a datetime object.
-
-    Accepts:
-      - "YYYY-MM-DD"
-      - "YYYY-MM-DD HH:MM:SS"
-      - "YYYY-MM-DD HH:MM"
-      - "YYYY-MM-DDTHH:MM" / "YYYY-MM-DDTHH:MM:SS" (datetime-local input)
-
-    Raises HTTPException(400) with a clear, field-specific message on any
-    invalid or missing value. Never raises anything else, so it never
-    surfaces as a 500.
-    """
     if value is None or not str(value).strip():
         raise HTTPException(status_code=400, detail=f"{field_name} is required.")
 
@@ -874,32 +756,40 @@ def _parse_datetime(value: Optional[str], field_name: str) -> datetime:
 
 
 def build_history_filter(
-    start_date: str,
-    end_date: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
     panel_id: Optional[str],
 ) -> Tuple[str, List]:
-    """
-    Validates start_date/end_date/panel_id and builds the shared SQL WHERE
-    clause + parameter list used by both GET /history and DELETE /history.
+    conditions = []
+    params = []
 
-    Uses `timestamp BETWEEN %s AND %s` (never DATE(timestamp)) so the
-    filter respects the exact time range requested, not just the day.
-    """
-    start_dt = _parse_datetime(start_date, "start_date")
-    end_dt = _parse_datetime(end_date, "end_date")
-
-    if start_dt > end_dt:
-        raise HTTPException(
-            status_code=400,
-            detail="start_date cannot be later than end_date.",
-        )
-
-    where_clause = "timestamp BETWEEN %s AND %s"
-    params: List = [start_dt, end_dt]
+    if start_date and str(start_date).strip() and end_date and str(end_date).strip():
+        start_dt = _parse_datetime(start_date, "start_date")
+        end_dt = _parse_datetime(end_date, "end_date")
+        if start_dt > end_dt:
+            raise HTTPException(
+                status_code=400,
+                detail="start_date cannot be later than end_date.",
+            )
+        conditions.append("timestamp BETWEEN %s AND %s")
+        params.extend([start_dt, end_dt])
+    elif start_date and str(start_date).strip():
+        start_dt = _parse_datetime(start_date, "start_date")
+        conditions.append("timestamp >= %s")
+        params.append(start_dt)
+    elif end_date and str(end_date).strip():
+        end_dt = _parse_datetime(end_date, "end_date")
+        conditions.append("timestamp <= %s")
+        params.append(end_dt)
 
     if panel_id is not None and panel_id.strip():
-        where_clause += " AND panel_id = %s"
+        conditions.append("panel_id = %s")
         params.append(panel_id.strip())
+
+    if conditions:
+        where_clause = " AND ".join(conditions)
+    else:
+        where_clause = "1=1"
 
     return where_clause, params
 
@@ -909,12 +799,10 @@ def build_history_filter(
 # -----------------------------
 @app.get("/history")
 def get_history(
-    start_date: str = Query(..., alias="start_date"),
-    end_date: str = Query(..., alias="end_date"),
+    start_date: Optional[str] = Query(None, alias="start_date"),
+    end_date: Optional[str] = Query(None, alias="end_date"),
     panel_id: Optional[str] = Query(None, alias="panel_id"),
 ):
-    # Validation happens first and outside the DB try/except below, so any
-    # bad input surfaces as a clean 400 - it never gets wrapped as a 500.
     where_clause, params = build_history_filter(start_date, end_date, panel_id)
 
     conn = None
@@ -949,29 +837,20 @@ def get_history(
     if not rows:
         return []
 
-    # Each historical row carries its OWN genuine relay_i1..i0 live
-    # reading AND its own fr_attrip_i1..i0 At-Trip snapshot, both
-    # returned unconditionally, exactly as stored. The API does not
-    # decide which one to display - that fault-aware choice (fr_attrip_*
-    # on a faulted row, relay_* otherwise) belongs solely to the
-    # Historical Records module on the frontend (table/chart/exports),
-    # via resolveRelayCurrents() in app.js. This keeps relay_i1..i0
-    # meaning the same thing everywhere in the API: the true live
-    # reading for that row, which is what the View Details -> "Relay
-    # Currents" section needs.
     history = []
     for row in rows:
         rec = row_to_dict(row, timestamp_as_string=True)
 
-        status_text = derive_fault_status(
-            rec["overcurrent_fault"],
-            rec["earth_fault"],
-            rec["event_type"],
-            rec["event_subtype"],
-        )
-        rec["fault_status"] = status_text
-        rec["live_fault_status"] = status_text
-        rec["historical_fault_status"] = status_text
+        # PRESERVE THE STORED HISTORICAL FAULT STATUS FROM POSTGRESQL DB RECORD
+        stored_status = rec.get("historical_fault_status") or rec.get("fault_status")
+        if not stored_status or not str(stored_status).strip():
+            stored_status = derive_fault_status(
+                rec["overcurrent_fault"],
+                rec["earth_fault"],
+                rec["event_type"],
+                rec["event_subtype"],
+            )
+        rec["fault_status"] = stored_status
 
         history.append(rec)
 
@@ -979,17 +858,14 @@ def get_history(
 
 
 # -----------------------------
-# DELETE /history - delete only records matching the given filters
+# DELETE /history - delete records matching filters
 # -----------------------------
 @app.delete("/history")
 def delete_history(
-    start_date: str = Query(..., alias="start_date"),
-    end_date: str = Query(..., alias="end_date"),
+    start_date: Optional[str] = Query(None, alias="start_date"),
+    end_date: Optional[str] = Query(None, alias="end_date"),
     panel_id: Optional[str] = Query(None, alias="panel_id"),
 ):
-    # Same shared validation as GET /history - guarantees DELETE can never
-    # run without a valid, bounded WHERE clause (i.e. can never wipe the
-    # whole table).
     where_clause, params = build_history_filter(start_date, end_date, panel_id)
 
     conn = None
