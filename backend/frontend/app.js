@@ -10,7 +10,7 @@ const API_BASE_URL = "https://mv-panel-monitoring-system-qobz.onrender.com";
 const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
 const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
 
-// Customer Accounts & Assigned Panels Configuration (Frontend Auth Demo)
+// Customer Accounts & Assigned Panels Configuration (Frontend Auth)
 const customerAccounts = {
   "CUST001": {
     panels: ["PANEL001", "PANEL002", "PANEL003"]
@@ -29,6 +29,47 @@ let telemetryChartInstance = null;
 let activeChartTab = "telemetry";
 let chartHistoryData = [];
 let currentHistoricalRecords = [];
+let currentSelectedModalRecord = null;
+
+// --------------------------------------------------------------------------
+// HELPER FUNCTIONS FOR STRICT DATA EXTRACT & FORMATTING (NO FAKE DEFAULTS)
+// --------------------------------------------------------------------------
+
+function hasValue(val) {
+  return val !== undefined && val !== null && val !== "";
+}
+
+function getRecordField(rec, keys) {
+  if (!rec) return undefined;
+  for (const key of keys) {
+    if (key.includes('.')) {
+      const parts = key.split('.');
+      let cur = rec;
+      for (const p of parts) {
+        if (cur !== undefined && cur !== null) {
+          cur = cur[p];
+        } else {
+          cur = undefined;
+          break;
+        }
+      }
+      if (hasValue(cur)) return cur;
+    } else if (hasValue(rec[key])) {
+      return rec[key];
+    }
+  }
+  return undefined;
+}
+
+function formatValue(val, decimals = null, unit = '') {
+  if (!hasValue(val)) return '--';
+  const num = Number(val);
+  if (isNaN(num)) return String(val) + (unit ? ` ${unit}` : '');
+  if (decimals !== null) {
+    return num.toFixed(decimals) + (unit ? ` ${unit}` : '');
+  }
+  return String(num) + (unit ? ` ${unit}` : '');
+}
 
 // --------------------------------------------------------------------------
 // 2. AUTHENTICATION & VIEW NAVIGATION
@@ -198,7 +239,7 @@ async function fetchLatestData() {
     const data = await response.json();
 
     // Verify if response contains valid telemetry object
-    if (!data || Object.keys(data).length === 0 || data.detail) {
+    if (!data || Object.keys(data).length === 0 || data.detail || data.message === "No Data Available") {
       updateConnectionStatus(true, "Online (No Data)");
       showNoDataAlert(selectedPanelId);
       clearDashboardMetrics();
@@ -239,7 +280,6 @@ function showNoDataAlert(panelId) {
   const alertContainer = document.getElementById('alertContainer');
   if (!alertContainer) return;
 
-  // Avoid duplicate no-data alert
   let alertBanner = document.getElementById('noDataAlertBanner');
   if (!alertBanner) {
     alertBanner = document.createElement('div');
@@ -336,10 +376,12 @@ function clearDashboardMetrics() {
   if (humBadge) humBadge.classList.add('hidden');
 
   // Fault Record
-  setText('frStageStart', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
-  setText('frStageTrip', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
-  setText('frStagePost80', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
-  setText('frStagePost200', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
+  setText('frStagePreStart', 'I1=-- A | I2=-- A | I3=-- A | I0=-- A');
+  setText('frStagePreStart_time', '--:--:--');
+  setText('frStageStart', 'I1=-- A | I2=-- A | I3=-- A | I0=-- A');
+  setText('frStageStart_time', '--:--:--');
+  setText('frStageTrip', 'I1=-- A | I2=-- A | I3=-- A | I0=-- A');
+  setText('frStageTrip_time', '--:--:--');
 }
 
 // --------------------------------------------------------------------------
@@ -351,10 +393,8 @@ function processTelemetryData(data) {
 
   const setText = (id, val) => {
     const el = document.getElementById(id);
-    if (el) el.textContent = (val !== undefined && val !== null) ? val : '--';
+    if (el) el.textContent = hasValue(val) ? val : '--';
   };
-
-  const hasVal = (v) => (v !== undefined && v !== null);
 
   // Browser receipt timestamp
   const nowStr = new Date().toLocaleTimeString();
@@ -366,41 +406,45 @@ function processTelemetryData(data) {
 
   // 1. RELAY PROTECTION (ABB REJ601)
   const sgActive = relay.sg_active;
-  setText('relaySG', hasVal(sgActive) ? `SG${sgActive}` : 'SG1');
+  setText('relaySG', hasValue(sgActive) ? `SG${sgActive}` : 'SG1');
 
-  const phasePickup = hasVal(relay.pickup_phase) ? Number(relay.pickup_phase) : 1;
-  const earthPickup = hasVal(relay.pickup_earth) ? Number(relay.pickup_earth) : 15;
+  const phasePickupVal = getRecordField(relay, ['pickup_phase']);
+  const earthPickupVal = getRecordField(relay, ['pickup_earth']);
+  const phasePickup = hasValue(phasePickupVal) ? Number(phasePickupVal) : 1;
+  const earthPickup = hasValue(earthPickupVal) ? Number(earthPickupVal) : 15;
 
-  setText('relayIPhasePickup', hasVal(relay.pickup_phase) ? `${relay.pickup_phase} A` : '-- A');
-  setText('relayIEarthPickup', hasVal(relay.pickup_earth) ? `${relay.pickup_earth} A` : '-- A');
-  setText('relayOpCounter', hasVal(relay.op_counter) ? relay.op_counter : '--');
+  setText('relayIPhasePickup', formatValue(phasePickupVal, null, 'A'));
+  setText('relayIEarthPickup', formatValue(earthPickupVal, null, 'A'));
+  setText('relayOpCounter', formatValue(getRecordField(relay, ['op_counter'])));
 
-  const i1 = hasVal(relay.i1) ? Number(relay.i1) : 0;
-  const i2 = hasVal(relay.i2) ? Number(relay.i2) : 0;
-  const i3 = hasVal(relay.i3) ? Number(relay.i3) : 0;
-  const i0 = hasVal(relay.i0) ? Number(relay.i0) : 0;
+  const i1Val = getRecordField(relay, ['i1']);
+  const i2Val = getRecordField(relay, ['i2']);
+  const i3Val = getRecordField(relay, ['i3']);
+  const i0Val = getRecordField(relay, ['i0']);
 
-  setText('relayI1', hasVal(relay.i1) ? i1.toFixed(2) : '--');
-  setText('relayI2', hasVal(relay.i2) ? i2.toFixed(2) : '--');
-  setText('relayI3', hasVal(relay.i3) ? i3.toFixed(2) : '--');
-  setText('relayI0', hasVal(relay.i0) ? i0.toFixed(2) : '--');
+  setText('relayI1', formatValue(i1Val, 2));
+  setText('relayI2', formatValue(i2Val, 2));
+  setText('relayI3', formatValue(i3Val, 2));
+  setText('relayI0', formatValue(i0Val, 2));
 
-  const negSeq = hasVal(relay.neg_seq) ? Number(relay.neg_seq) : 0;
-  const thermalLevel = hasVal(relay.thermal_level) ? Number(relay.thermal_level) : 0;
+  const negSeqVal = getRecordField(relay, ['neg_seq']);
+  const thermalLevelVal = getRecordField(relay, ['thermal_level']);
 
-  setText('relayNegSeq', hasVal(relay.neg_seq) ? `${negSeq.toFixed(2)} A` : '-- A');
-  setText('relayThermal', hasVal(relay.thermal_level) ? `${thermalLevel.toFixed(1)} %` : '-- %');
+  setText('relayNegSeq', formatValue(negSeqVal, 2, 'A'));
+  setText('relayThermal', formatValue(thermalLevelVal, 1, '%'));
 
   const thermalBar = document.getElementById('thermalBar');
-  if (thermalBar) thermalBar.style.width = `${Math.min(thermalLevel, 100)}%`;
+  if (thermalBar && hasValue(thermalLevelVal)) {
+    thermalBar.style.width = `${Math.min(Number(thermalLevelVal), 100)}%`;
+  }
 
-  // Fault Alarm Pills
-  updatePill('pillI1', hasVal(relay.i1) && i1 > phasePickup);
-  updatePill('pillI2', hasVal(relay.i2) && i2 > phasePickup);
-  updatePill('pillI3', hasVal(relay.i3) && i3 > phasePickup);
-  updatePill('pillI0', hasVal(relay.i0) && i0 > earthPickup);
+  // Live Fault Alarm Pills (comparison against pickup values)
+  updatePill('pillI1', hasValue(i1Val) && Number(i1Val) > phasePickup);
+  updatePill('pillI2', hasValue(i2Val) && Number(i2Val) > phasePickup);
+  updatePill('pillI3', hasValue(i3Val) && Number(i3Val) > phasePickup);
+  updatePill('pillI0', hasValue(i0Val) && Number(i0Val) > earthPickup);
 
-  // Live Fault Status Banner (from data.relay.live_fault_status)
+  // Live Fault Status Banner (from data.relay.live_fault_status ONLY)
   const liveFaultStatus = relay.live_fault_status || "No Fault Detected";
   const faultBanner = document.getElementById('faultSummaryBanner');
   const faultIcon = document.getElementById('faultIcon');
@@ -418,100 +462,105 @@ function processTelemetryData(data) {
 
   // Event log & RTC
   const evt = relay.event || {};
-  setText('eventType', hasVal(evt.type) ? evt.type : '--');
-  setText('eventSubtype', hasVal(evt.subtype) ? evt.subtype : '--');
-  setText('eventTime', evt.timestamp || '--/--/-- --:--:--');
-  setText('relayRtc', relay.rtc || '--/--/20-- --:--:--');
+  setText('eventType', formatValue(evt.type));
+  setText('eventSubtype', formatValue(evt.subtype));
+  setText('eventTime', formatValue(evt.timestamp));
+  setText('relayRtc', formatValue(relay.rtc));
 
   // 2. EMS-01 POWER QUALITY METER
-  const vR = hasVal(meter.v_r) ? Number(meter.v_r) : 0;
-  const vY = hasVal(meter.v_y) ? Number(meter.v_y) : 0;
-  const vB = hasVal(meter.v_b) ? Number(meter.v_b) : 0;
+  const vRVal = getRecordField(meter, ['v_r']);
+  const vYVal = getRecordField(meter, ['v_y']);
+  const vBVal = getRecordField(meter, ['v_b']);
 
-  const iR = hasVal(meter.i_r) ? Number(meter.i_r) : 0;
-  const iY = hasVal(meter.i_y) ? Number(meter.i_y) : 0;
-  const iB = hasVal(meter.i_b) ? Number(meter.i_b) : 0;
+  const iRVal = getRecordField(meter, ['i_r']);
+  const iYVal = getRecordField(meter, ['i_y']);
+  const iBVal = getRecordField(meter, ['i_b']);
 
-  const pfR = hasVal(meter.pf_r) ? Number(meter.pf_r) : 1.0;
-  const pfY = hasVal(meter.pf_y) ? Number(meter.pf_y) : 1.0;
-  const pfB = hasVal(meter.pf_b) ? Number(meter.pf_b) : 1.0;
-  const pfT = hasVal(meter.pf_t) ? Number(meter.pf_t) : 1.0;
+  const pfRVal = getRecordField(meter, ['pf_r']);
+  const pfYVal = getRecordField(meter, ['pf_y']);
+  const pfBVal = getRecordField(meter, ['pf_b']);
+  const pfTVal = getRecordField(meter, ['pf_t']);
 
-  const pR = hasVal(meter.p_r) ? Number(meter.p_r) : 0;
-  const pY = hasVal(meter.p_y) ? Number(meter.p_y) : 0;
-  const pB = hasVal(meter.p_b) ? Number(meter.p_b) : 0;
-  const pT = hasVal(meter.p_t) ? Number(meter.p_t) : 0;
+  const pRVal = getRecordField(meter, ['p_r']);
+  const pYVal = getRecordField(meter, ['p_y']);
+  const pBVal = getRecordField(meter, ['p_b']);
+  const pTVal = getRecordField(meter, ['p_t']);
 
-  const freq = hasVal(meter.frequency) ? Number(meter.frequency) : 50.0;
+  const freqVal = getRecordField(meter, ['frequency']);
 
-  setText('meterVR', hasVal(meter.v_r) ? `${vR.toFixed(1)} V` : '-- V');
-  setText('meterVY', hasVal(meter.v_y) ? `${vY.toFixed(1)} V` : '-- V');
-  setText('meterVB', hasVal(meter.v_b) ? `${vB.toFixed(1)} V` : '-- V');
+  setText('meterVR', formatValue(vRVal, 1, 'V'));
+  setText('meterVY', formatValue(vYVal, 1, 'V'));
+  setText('meterVB', formatValue(vBVal, 1, 'V'));
 
-  setText('meterIR', hasVal(meter.i_r) ? iR.toFixed(2) : '--');
-  setText('meterIY', hasVal(meter.i_y) ? iY.toFixed(2) : '--');
-  setText('meterIB', hasVal(meter.i_b) ? iB.toFixed(2) : '--');
+  setText('meterIR', formatValue(iRVal, 2));
+  setText('meterIY', formatValue(iYVal, 2));
+  setText('meterIB', formatValue(iBVal, 2));
 
-  setText('meterPFR', hasVal(meter.pf_r) ? pfR.toFixed(2) : '--');
-  setText('meterPFY', hasVal(meter.pf_y) ? pfY.toFixed(2) : '--');
-  setText('meterPFB', hasVal(meter.pf_b) ? pfB.toFixed(2) : '--');
+  setText('meterPFR', formatValue(pfRVal, 2));
+  setText('meterPFY', formatValue(pfYVal, 2));
+  setText('meterPFB', formatValue(pfBVal, 2));
 
-  setText('meterPR', hasVal(meter.p_r) ? pR.toFixed(2) : '--');
-  setText('meterPY', hasVal(meter.p_y) ? pY.toFixed(2) : '--');
-  setText('meterPB', hasVal(meter.p_b) ? pB.toFixed(2) : '--');
+  setText('meterPR', formatValue(pRVal, 2));
+  setText('meterPY', formatValue(pYVal, 2));
+  setText('meterPB', formatValue(pBVal, 2));
 
-  setText('meterPFT', hasVal(meter.pf_t) ? pfT.toFixed(2) : '--');
-  setText('meterPT', hasVal(meter.p_t) ? `${pT.toFixed(2)} kW` : '-- kW');
-  setText('meterFreq', hasVal(meter.frequency) ? `${freq.toFixed(2)} Hz` : '-- Hz');
+  setText('meterPFT', formatValue(pfTVal, 2));
+  setText('meterPT', formatValue(pTVal, 2, 'kW'));
+  setText('meterFreq', formatValue(freqVal, 2, 'Hz'));
 
   // 3. SYSTEM TELEMETRY SUMMARY CARDS
-  const avgV = (hasVal(meter.v_r) && hasVal(meter.v_y) && hasVal(meter.v_b))
-    ? (vR + vY + vB) / 3
+  const avgV = (hasValue(vRVal) && hasValue(vYVal) && hasValue(vBVal))
+    ? (Number(vRVal) + Number(vYVal) + Number(vBVal)) / 3
     : null;
 
-  setText('sumFreq', hasVal(meter.frequency) ? freq.toFixed(2) : '--');
-  setText('sumPower', hasVal(meter.p_t) ? pT.toFixed(2) : '--');
-  setText('sumPF', hasVal(meter.pf_t) ? pfT.toFixed(2) : '--');
+  setText('sumFreq', formatValue(freqVal, 2));
+  setText('sumPower', formatValue(pTVal, 2));
+  setText('sumPF', formatValue(pfTVal, 2));
   setText('sumAvgV', avgV !== null ? avgV.toFixed(1) : '--');
 
   // 4. DHT22 ENVIRONMENTAL DATA
-  const temp = hasVal(dht.temperature) ? Number(dht.temperature) : 0;
-  const hum = hasVal(dht.humidity) ? Number(dht.humidity) : 0;
+  const tempVal = getRecordField(dht, ['temperature']);
+  const humVal = getRecordField(dht, ['humidity']);
 
-  setText('dhtTemp', hasVal(dht.temperature) ? temp.toFixed(1) : '--');
-  setText('dhtHum', hasVal(dht.humidity) ? hum.toFixed(1) : '--');
+  setText('dhtTemp', formatValue(tempVal, 1));
+  setText('dhtHum', formatValue(humVal, 1));
 
-  setText('sumTemp', hasVal(dht.temperature) ? temp.toFixed(1) : '--');
-  setText('sumHum', hasVal(dht.humidity) ? hum.toFixed(1) : '--');
+  setText('sumTemp', formatValue(tempVal, 1));
+  setText('sumHum', formatValue(humVal, 1));
 
   const tempBadge = document.getElementById('tempAlertBadge');
   const humBadge = document.getElementById('humAlertBadge');
 
   if (tempBadge) {
-    if (hasVal(dht.temperature) && temp > 50.0) tempBadge.classList.remove('hidden');
+    if (hasValue(tempVal) && Number(tempVal) > 50.0) tempBadge.classList.remove('hidden');
     else tempBadge.classList.add('hidden');
   }
   if (humBadge) {
-    if (hasVal(dht.humidity) && hum > 80.0) humBadge.classList.remove('hidden');
+    if (hasValue(humVal) && Number(humVal) > 80.0) humBadge.classList.remove('hidden');
     else humBadge.classList.add('hidden');
   }
 
-  // 5. HISTORICAL FAULT RECORD TIMELINE (data.relay.fault_record1)
+  // 5. HISTORICAL FAULT RECORD TIMELINE (data.relay.fault_record1 - LAST STORED TRIP)
   const fr = relay.fault_record1 || relay.fault_record_1;
   if (fr) {
+    if (fr.pre_start) setText('frStagePreStart', fr.pre_start);
     if (fr.at_start_time) setText('frStageStart_time', fr.at_start_time);
-    if (fr.at_start) {
-      setText('frStageStart', fr.at_start);
-    } else if (fr.pre_start) {
-      setText('frStageStart', fr.pre_start);
-    }
-
+    if (fr.at_start) setText('frStageStart', fr.at_start);
     if (fr.at_trip_time) setText('frStageTrip_time', fr.at_trip_time);
     if (fr.at_trip) setText('frStageTrip', fr.at_trip);
   }
 
   // 6. UPDATE LIVE TELEMETRY TREND CHARTS
-  pushChartPoint(nowStr, { i1, i2, i3, vR, vY, vB, temp, hum });
+  pushChartPoint(nowStr, {
+    i1: hasValue(i1Val) ? Number(i1Val) : null,
+    i2: hasValue(i2Val) ? Number(i2Val) : null,
+    i3: hasValue(i3Val) ? Number(i3Val) : null,
+    vR: hasValue(vRVal) ? Number(vRVal) : null,
+    vY: hasValue(vYVal) ? Number(vYVal) : null,
+    vB: hasValue(vBVal) ? Number(vBVal) : null,
+    temp: hasValue(tempVal) ? Number(tempVal) : null,
+    hum: hasValue(humVal) ? Number(humVal) : null
+  });
 }
 
 function updatePill(pillId, isAlarm) {
@@ -638,7 +687,7 @@ async function searchHistoricalData() {
 
   const tableBody = document.getElementById('histTableBody');
   if (tableBody) {
-    tableBody.innerHTML = `<tr><td colspan="15" style="text-align: center; color: var(--text-muted); padding: 20px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading panel records...</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--text-muted); padding: 20px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading panel records...</td></tr>`;
   }
 
   try {
@@ -668,32 +717,54 @@ function renderHistoricalTable(records) {
   if (recordCountEl) recordCountEl.textContent = records.length;
 
   if (!records || records.length === 0) {
-    tableBody.innerHTML = `<tr><td colspan="15" style="text-align: center; color: var(--text-dim); padding: 20px;">No historical records found for ${selectedPanelId}.</td></tr>`;
+    tableBody.innerHTML = `<tr><td colspan="11" style="text-align: center; color: var(--text-dim); padding: 20px;">No historical records found for ${selectedPanelId}.</td></tr>`;
     return;
   }
 
   tableBody.innerHTML = '';
   records.forEach((rec, idx) => {
     const tr = document.createElement('tr');
-    const faultStatus = rec.fault_status || 'No Fault Detected';
+    
+    const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at', 'event_timestamp']));
+    const panelId = formatValue(getRecordField(rec, ['panel_id']), null) !== '--' ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+
+    // TIME-SPECIFIC FAULT STATUS FOR THIS PARTICULAR DATABASE RECORD ONLY
+    const faultStatusVal = getRecordField(rec, ['fault_status', 'historical_fault_status', 'live_fault_status']);
+    const faultStatus = hasValue(faultStatusVal) ? faultStatusVal : 'No Fault Detected';
+    
     const isFaulted = faultStatus !== 'No Fault Detected' && !faultStatus.toLowerCase().includes('normal');
     const badgeClass = isFaulted ? 'fault-badge fault-bad' : 'fault-badge fault-ok';
 
+    // Currents for this specific historical record
+    let i1Val = getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']);
+    let i2Val = getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']);
+    let i3Val = getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']);
+    let i0Val = getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']);
+
+    // If record was a fault event, display its At-Trip currents if available
+    if (isFaulted && hasValue(getRecordField(rec, ['fr_attrip_i1']))) {
+      i1Val = getRecordField(rec, ['fr_attrip_i1']);
+      i2Val = getRecordField(rec, ['fr_attrip_i2']);
+      i3Val = getRecordField(rec, ['fr_attrip_i3']);
+      i0Val = getRecordField(rec, ['fr_attrip_i0']);
+    }
+
+    // Voltages for this specific historical record
+    let vrVal = getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']);
+    let vyVal = getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']);
+    let vbVal = getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']);
+
     tr.innerHTML = `
-      <td>${rec.timestamp || rec.created_at || '--'}</td>
-      <td><strong>${rec.panel_id || selectedPanelId}</strong></td>
+      <td>${timestamp}</td>
+      <td><strong>${panelId}</strong></td>
       <td><span class="${badgeClass}">${faultStatus}</span></td>
-      <td>${rec.i1 !== undefined ? rec.i1 : '--'}</td>
-      <td>${rec.i2 !== undefined ? rec.i2 : '--'}</td>
-      <td>${rec.i3 !== undefined ? rec.i3 : '--'}</td>
-      <td>${rec.i0 !== undefined ? rec.i0 : '--'}</td>
-      <td>${rec.vr !== undefined ? rec.vr : '--'}</td>
-      <td>${rec.vy !== undefined ? rec.vy : '--'}</td>
-      <td>${rec.vb !== undefined ? rec.vb : '--'}</td>
-      <td>${rec.total_power_p_t !== undefined ? rec.total_power_p_t : '--'}</td>
-      <td>${rec.total_power_factor !== undefined ? rec.total_power_factor : '--'}</td>
-      <td>${rec.temperature !== undefined ? rec.temperature : '--'}</td>
-      <td>${rec.humidity !== undefined ? rec.humidity : '--'}</td>
+      <td>${formatValue(i1Val, 2)}</td>
+      <td>${formatValue(i2Val, 2)}</td>
+      <td>${formatValue(i3Val, 2)}</td>
+      <td>${formatValue(i0Val, 2)}</td>
+      <td>${formatValue(vrVal, 1)}</td>
+      <td>${formatValue(vyVal, 1)}</td>
+      <td>${formatValue(vbVal, 1)}</td>
       <td>
         <button class="view-details-btn" onclick="openDetailsModal(${idx})">
           <i class="fa-solid fa-eye"></i> Details
@@ -725,9 +796,80 @@ function openDetailsModal(index) {
   const rec = currentHistoricalRecords[index];
   if (!rec) return;
 
+  currentSelectedModalRecord = rec;
+
   const modalBody = document.getElementById('modalBody');
   const modal = document.getElementById('recordDetailsModal');
   if (!modalBody || !modal) return;
+
+  const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
+  const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
+
+  // Relay data
+  const sg = formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active']));
+  const phasePickup = formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase']), null, 'A');
+  const earthPickup = formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth']), null, 'A');
+  const opCounter = formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter']));
+
+  const i1 = formatValue(getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']), 2, 'A');
+  const i2 = formatValue(getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']), 2, 'A');
+  const i3 = formatValue(getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']), 2, 'A');
+  const i0 = formatValue(getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']), 2, 'A');
+  const negSeq = formatValue(getRecordField(rec, ['negative_sequence_current', 'neg_seq', 'negative_sequence_i2', 'relay.neg_seq']), 2, 'A');
+  const thermalLevel = formatValue(getRecordField(rec, ['thermal_level', 'relay.thermal_level']), 1, '%');
+  const relayRtc = formatValue(getRecordField(rec, ['relay_rtc', 'rtc', 'relay.rtc']));
+
+  // Meter data
+  const vr = formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1, 'V');
+  const vy = formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1, 'V');
+  const vb = formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1, 'V');
+  const pTotal = formatValue(getRecordField(rec, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2, 'kW');
+  const pfTotal = formatValue(getRecordField(rec, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2);
+  const freq = formatValue(getRecordField(rec, ['meter_frequency', 'frequency', 'meter.frequency']), 2, 'Hz');
+
+  // DHT22 data
+  const temp = formatValue(getRecordField(rec, ['temperature', 'dht.temperature']), 1, '°C');
+  const hum = formatValue(getRecordField(rec, ['humidity', 'dht.humidity']), 1, '%');
+
+  // Fault Record Details (ONLY if present on this specific historical record)
+  const isTripRecord = faultStatus !== 'No Fault Detected' || hasValue(getRecordField(rec, ['fr_attrip_timestamp']));
+  let faultDetailsHtml = '';
+
+  if (isTripRecord) {
+    const preI1 = formatValue(getRecordField(rec, ['fr_prestart_i1']), 2);
+    const preI2 = formatValue(getRecordField(rec, ['fr_prestart_i2']), 2);
+    const preI3 = formatValue(getRecordField(rec, ['fr_prestart_i3']), 2);
+    const preI0 = formatValue(getRecordField(rec, ['fr_prestart_i0']), 2);
+
+    const startI1 = formatValue(getRecordField(rec, ['fr_atstart_i1']), 2);
+    const startI2 = formatValue(getRecordField(rec, ['fr_atstart_i2']), 2);
+    const startI3 = formatValue(getRecordField(rec, ['fr_atstart_i3']), 2);
+    const startI0 = formatValue(getRecordField(rec, ['fr_atstart_i0']), 2);
+    const startTime = formatValue(getRecordField(rec, ['fr_atstart_timestamp']));
+
+    const tripI1 = formatValue(getRecordField(rec, ['fr_attrip_i1']), 2);
+    const tripI2 = formatValue(getRecordField(rec, ['fr_attrip_i2']), 2);
+    const tripI3 = formatValue(getRecordField(rec, ['fr_attrip_i3']), 2);
+    const tripI0 = formatValue(getRecordField(rec, ['fr_attrip_i0']), 2);
+    const tripTime = formatValue(getRecordField(rec, ['fr_attrip_timestamp']));
+
+    faultDetailsHtml = `
+      <div class="detail-section">
+        <div class="detail-section-title"><i class="fa-solid fa-triangle-exclamation"></i> Associated Fault Event Record</div>
+        <div class="detail-fields-grid">
+          <div class="detail-field"><span class="detail-field-label">Pre-Start Currents</span><span class="detail-field-value">I1=${preI1} A | I2=${preI2} A | I3=${preI3} A | I0=${preI0} A</span></div>
+          <div class="detail-field"><span class="detail-field-label">At Start Currents</span><span class="detail-field-value">I1=${startI1} A | I2=${startI2} A | I3=${startI3} A | I0=${startI0} A</span></div>
+          <div class="detail-field"><span class="detail-field-label">At Start Time</span><span class="detail-field-value">${startTime}</span></div>
+          <div class="detail-field"><span class="detail-field-label">At Trip Currents</span><span class="detail-field-value highlight-orange">I1=${tripI1} A | I2=${tripI2} A | I3=${tripI3} A | I0=${tripI0} A</span></div>
+          <div class="detail-field"><span class="detail-field-label">At Trip Time</span><span class="detail-field-value">${tripTime}</span></div>
+          <div class="detail-field"><span class="detail-field-label">Trip Status</span><span class="detail-field-value highlight-yellow">${faultStatus}</span></div>
+        </div>
+      </div>
+    `;
+  }
 
   modalBody.innerHTML = `
     <div class="detail-section">
@@ -735,7 +877,7 @@ function openDetailsModal(index) {
       <div class="detail-fields-grid">
         <div class="detail-field">
           <span class="detail-field-label">Panel ID</span>
-          <span class="detail-field-value highlight-cyan">${rec.panel_id || selectedPanelId}</span>
+          <span class="detail-field-value highlight-cyan">${panelId}</span>
         </div>
         <div class="detail-field">
           <span class="detail-field-label">Customer ID</span>
@@ -743,11 +885,11 @@ function openDetailsModal(index) {
         </div>
         <div class="detail-field">
           <span class="detail-field-label">Timestamp</span>
-          <span class="detail-field-value">${rec.timestamp || rec.created_at || '--'}</span>
+          <span class="detail-field-value">${timestamp}</span>
         </div>
         <div class="detail-field">
           <span class="detail-field-label">Fault Status</span>
-          <span class="detail-field-value highlight-yellow">${rec.fault_status || 'No Fault Detected'}</span>
+          <span class="detail-field-value highlight-yellow">${faultStatus}</span>
         </div>
       </div>
     </div>
@@ -755,37 +897,147 @@ function openDetailsModal(index) {
     <div class="detail-section">
       <div class="detail-section-title"><i class="fa-solid fa-shield-halved"></i> ABB REJ601 Relay Telemetry</div>
       <div class="detail-fields-grid">
-        <div class="detail-field"><span class="detail-field-label">Phase I1</span><span class="detail-field-value">${rec.i1 || 0} A</span></div>
-        <div class="detail-field"><span class="detail-field-label">Phase I2</span><span class="detail-field-value">${rec.i2 || 0} A</span></div>
-        <div class="detail-field"><span class="detail-field-label">Phase I3</span><span class="detail-field-value">${rec.i3 || 0} A</span></div>
-        <div class="detail-field"><span class="detail-field-label">Earth I0</span><span class="detail-field-value">${rec.i0 || 0} A</span></div>
-        <div class="detail-field"><span class="detail-field-label">Negative Seq I2</span><span class="detail-field-value">${rec.negative_sequence_i2 || 0} A</span></div>
-        <div class="detail-field"><span class="detail-field-label">Thermal Level</span><span class="detail-field-value">${rec.thermal_level || 0} %</span></div>
+        <div class="detail-field"><span class="detail-field-label">Setting Group</span><span class="detail-field-value">${sg}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase Pickup</span><span class="detail-field-value">${phasePickup}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Earth Pickup</span><span class="detail-field-value">${earthPickup}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Op Counter</span><span class="detail-field-value">${opCounter}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase I1</span><span class="detail-field-value">${i1}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase I2</span><span class="detail-field-value">${i2}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase I3</span><span class="detail-field-value">${i3}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Earth I0</span><span class="detail-field-value">${i0}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Negative Seq I2</span><span class="detail-field-value">${negSeq}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Thermal Level</span><span class="detail-field-value">${thermalLevel}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Relay RTC</span><span class="detail-field-value">${relayRtc}</span></div>
       </div>
     </div>
+
+    ${faultDetailsHtml}
 
     <div class="detail-section">
       <div class="detail-section-title"><i class="fa-solid fa-gauge-high"></i> EMS-01 Power Quality Meter</div>
       <div class="detail-fields-grid">
-        <div class="detail-field"><span class="detail-field-label">V_R Voltage</span><span class="detail-field-value">${rec.vr || 0} V</span></div>
-        <div class="detail-field"><span class="detail-field-label">V_Y Voltage</span><span class="detail-field-value">${rec.vy || 0} V</span></div>
-        <div class="detail-field"><span class="detail-field-label">V_B Voltage</span><span class="detail-field-value">${rec.vb || 0} V</span></div>
-        <div class="detail-field"><span class="detail-field-label">Total Power</span><span class="detail-field-value highlight-green">${rec.total_power_p_t || 0} kW</span></div>
-        <div class="detail-field"><span class="detail-field-label">Total PF</span><span class="detail-field-value">${rec.total_power_factor || 0}</span></div>
-        <div class="detail-field"><span class="detail-field-label">Frequency</span><span class="detail-field-value">${rec.frequency || 50.0} Hz</span></div>
+        <div class="detail-field"><span class="detail-field-label">V_R Voltage</span><span class="detail-field-value">${vr}</span></div>
+        <div class="detail-field"><span class="detail-field-label">V_Y Voltage</span><span class="detail-field-value">${vy}</span></div>
+        <div class="detail-field"><span class="detail-field-label">V_B Voltage</span><span class="detail-field-value">${vb}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Total Power</span><span class="detail-field-value highlight-green">${pTotal}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Total PF</span><span class="detail-field-value">${pfTotal}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Frequency</span><span class="detail-field-value">${freq}</span></div>
       </div>
     </div>
 
     <div class="detail-section">
       <div class="detail-section-title"><i class="fa-solid fa-temperature-half"></i> DHT22 Environmental Data</div>
       <div class="detail-fields-grid">
-        <div class="detail-field"><span class="detail-field-label">Temperature</span><span class="detail-field-value highlight-orange">${rec.temperature || 0} °C</span></div>
-        <div class="detail-field"><span class="detail-field-label">Humidity</span><span class="detail-field-value highlight-purple">${rec.humidity || 0} %</span></div>
+        <div class="detail-field"><span class="detail-field-label">Temperature</span><span class="detail-field-value highlight-orange">${temp}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Humidity</span><span class="detail-field-value highlight-purple">${hum}</span></div>
       </div>
     </div>
   `;
 
   modal.classList.remove('hidden');
+}
+
+function exportSingleRecordPdf() {
+  if (!currentSelectedModalRecord) {
+    alert("No record selected.");
+    return;
+  }
+  const rec = currentSelectedModalRecord;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+
+  const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
+  const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
+
+  doc.setFontSize(14);
+  doc.text(`MV Substation Telemetry Record Snapshot`, 14, 15);
+  doc.setFontSize(10);
+  doc.text(`Panel: ${panelId} | Timestamp: ${timestamp} | Customer: ${currentCustomer || '--'}`, 14, 22);
+
+  const tableData = [
+    ["Parameter", "Value"],
+    ["Panel ID", panelId],
+    ["Customer ID", currentCustomer || '--'],
+    ["Timestamp", timestamp],
+    ["Fault Status", faultStatus],
+    ["Phase I1 Current", formatValue(getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']), 2, 'A')],
+    ["Phase I2 Current", formatValue(getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']), 2, 'A')],
+    ["Phase I3 Current", formatValue(getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']), 2, 'A')],
+    ["Earth I0 Current", formatValue(getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']), 2, 'A')],
+    ["Negative Sequence I2", formatValue(getRecordField(rec, ['negative_sequence_current', 'neg_seq', 'relay.neg_seq']), 2, 'A')],
+    ["Thermal Level", formatValue(getRecordField(rec, ['thermal_level', 'relay.thermal_level']), 1, '%')],
+    ["Setting Group", formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active']))],
+    ["Phase Pickup", formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase']), null, 'A')],
+    ["Earth Pickup", formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth']), null, 'A')],
+    ["Op Counter", formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter']))],
+    ["V_R Voltage", formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1, 'V')],
+    ["V_Y Voltage", formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1, 'V')],
+    ["V_B Voltage", formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1, 'V')],
+    ["Frequency", formatValue(getRecordField(rec, ['meter_frequency', 'frequency', 'meter.frequency']), 2, 'Hz')],
+    ["Total Power Factor", formatValue(getRecordField(rec, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2)],
+    ["Total Power (P_T)", formatValue(getRecordField(rec, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2, 'kW')],
+    ["Temperature", formatValue(getRecordField(rec, ['temperature', 'dht.temperature']), 1, '°C')],
+    ["Humidity", formatValue(getRecordField(rec, ['humidity', 'dht.humidity']), 1, '%')]
+  ];
+
+  doc.autoTable({
+    head: [tableData[0]],
+    body: tableData.slice(1),
+    startY: 28,
+    styles: { fontSize: 9, cellPadding: 3 },
+    headStyles: { fillColor: [6, 182, 212] }
+  });
+
+  const dateStr = String(timestamp || 'record').replace(/[/\\?%*:|"<>]/g, '_');
+  doc.save(`Record_${panelId}_${dateStr}.pdf`);
+}
+
+function exportSingleRecordExcel() {
+  if (!currentSelectedModalRecord) {
+    alert("No record selected.");
+    return;
+  }
+  const rec = currentSelectedModalRecord;
+  const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
+  const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
+
+  const exportData = [{
+    "Timestamp": timestamp,
+    "Panel ID": panelId,
+    "Customer ID": currentCustomer || '--',
+    "Fault Status": faultStatus,
+    "I1 (A)": formatValue(getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']), 2),
+    "I2 (A)": formatValue(getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']), 2),
+    "I3 (A)": formatValue(getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']), 2),
+    "I0 (A)": formatValue(getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']), 2),
+    "Neg Seq I2 (A)": formatValue(getRecordField(rec, ['negative_sequence_current', 'neg_seq', 'relay.neg_seq']), 2),
+    "Thermal Level (%)": formatValue(getRecordField(rec, ['thermal_level', 'relay.thermal_level']), 1),
+    "Active SG": formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active'])),
+    "Phase Pickup (A)": formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase'])),
+    "Earth Pickup (A)": formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth'])),
+    "Op Counter": formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter'])),
+    "V_R (V)": formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
+    "V_Y (V)": formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
+    "V_B (V)": formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1),
+    "Frequency (Hz)": formatValue(getRecordField(rec, ['meter_frequency', 'frequency', 'meter.frequency']), 2),
+    "Total PF": formatValue(getRecordField(rec, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2),
+    "Total Power (kW)": formatValue(getRecordField(rec, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2),
+    "Temperature (°C)": formatValue(getRecordField(rec, ['temperature', 'dht.temperature']), 1),
+    "Humidity (%)": formatValue(getRecordField(rec, ['humidity', 'dht.humidity']), 1)
+  }];
+
+  const worksheet = XLSX.utils.json_to_sheet(exportData);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Record Snapshot");
+
+  const dateStr = String(timestamp || 'record').replace(/[/\\?%*:|"<>]/g, '_');
+  XLSX.writeFile(workbook, `Record_${panelId}_${dateStr}.xlsx`);
 }
 
 function closeDetailsModal() {
@@ -794,7 +1046,7 @@ function closeDetailsModal() {
 }
 
 // --------------------------------------------------------------------------
-// 9. EXPORTS (EXCEL & PDF)
+// 9. EXPORTS (EXCEL & PDF FOR HISTORICAL LOG SEARCH RESULTS)
 // --------------------------------------------------------------------------
 
 function exportHistoricalExcel() {
@@ -804,21 +1056,23 @@ function exportHistoricalExcel() {
   }
 
   const exportData = currentHistoricalRecords.map(r => ({
-    "Timestamp": r.timestamp || r.created_at || "",
-    "Customer ID": currentCustomer || "",
-    "Panel ID": r.panel_id || selectedPanelId,
-    "Fault Status": r.fault_status || "No Fault Detected",
-    "I1 Current (A)": r.i1 !== undefined ? r.i1 : "",
-    "I2 Current (A)": r.i2 !== undefined ? r.i2 : "",
-    "I3 Current (A)": r.i3 !== undefined ? r.i3 : "",
-    "I0 Earth (A)": r.i0 !== undefined ? r.i0 : "",
-    "VR Voltage (V)": r.vr !== undefined ? r.vr : "",
-    "VY Voltage (V)": r.vy !== undefined ? r.vy : "",
-    "VB Voltage (V)": r.vb !== undefined ? r.vb : "",
-    "Total Power (kW)": r.total_power_p_t !== undefined ? r.total_power_p_t : "",
-    "Power Factor": r.total_power_factor !== undefined ? r.total_power_factor : "",
-    "Temperature (°C)": r.temperature !== undefined ? r.temperature : "",
-    "Humidity (%)": r.humidity !== undefined ? r.humidity : ""
+    "Timestamp": formatValue(getRecordField(r, ['timestamp', 'created_at'])),
+    "Customer ID": currentCustomer || "--",
+    "Panel ID": hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
+    "Fault Status": hasValue(getRecordField(r, ['fault_status', 'historical_fault_status']))
+      ? getRecordField(r, ['fault_status', 'historical_fault_status'])
+      : 'No Fault Detected',
+    "I1 Current (A)": formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
+    "I2 Current (A)": formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
+    "I3 Current (A)": formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
+    "I0 Earth (A)": formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
+    "VR Voltage (V)": formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
+    "VY Voltage (V)": formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
+    "VB Voltage (V)": formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1),
+    "Total Power (kW)": formatValue(getRecordField(r, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2),
+    "Power Factor": formatValue(getRecordField(r, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2),
+    "Temperature (°C)": formatValue(getRecordField(r, ['temperature', 'dht.temperature']), 1),
+    "Humidity (%)": formatValue(getRecordField(r, ['humidity', 'dht.humidity']), 1)
   }));
 
   const worksheet = XLSX.utils.json_to_sheet(exportData);
@@ -842,22 +1096,20 @@ function exportHistoricalPdf() {
   doc.setFontSize(10);
   doc.text(`Customer: ${currentCustomer} | Export Date: ${new Date().toLocaleString()}`, 14, 22);
 
-  const tableColumn = ["Timestamp", "Panel", "Fault Status", "I1(A)", "I2(A)", "I3(A)", "I0(A)", "VR(V)", "VY(V)", "VB(V)", "P_T(kW)", "PF", "Temp(°C)", "Hum(%)"];
+  const tableColumn = ["Timestamp", "Panel", "Fault Status", "I1(A)", "I2(A)", "I3(A)", "I0(A)", "VR(V)", "VY(V)", "VB(V)"];
   const tableRows = currentHistoricalRecords.map(r => [
-    r.timestamp || r.created_at || "",
-    r.panel_id || selectedPanelId,
-    r.fault_status || "Normal",
-    r.i1 !== undefined ? r.i1 : "",
-    r.i2 !== undefined ? r.i2 : "",
-    r.i3 !== undefined ? r.i3 : "",
-    r.i0 !== undefined ? r.i0 : "",
-    r.vr !== undefined ? r.vr : "",
-    r.vy !== undefined ? r.vy : "",
-    r.vb !== undefined ? r.vb : "",
-    r.total_power_p_t !== undefined ? r.total_power_p_t : "",
-    r.total_power_factor !== undefined ? r.total_power_factor : "",
-    r.temperature !== undefined ? r.temperature : "",
-    r.humidity !== undefined ? r.humidity : ""
+    formatValue(getRecordField(r, ['timestamp', 'created_at'])),
+    hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
+    hasValue(getRecordField(r, ['fault_status', 'historical_fault_status']))
+      ? getRecordField(r, ['fault_status', 'historical_fault_status'])
+      : 'No Fault Detected',
+    formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
+    formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
+    formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
+    formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
+    formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
+    formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
+    formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1)
   ]);
 
   doc.autoTable({

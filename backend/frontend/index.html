@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -23,7 +22,6 @@
   <!-- ==========================================================================
        VIEW 1: CUSTOMER LOGIN SCREEN
        ========================================================================== -->
-
   <div id="loginView" class="auth-wrapper">
     <div class="auth-card">
       <div class="auth-header">
@@ -54,7 +52,6 @@
   <!-- ==========================================================================
        VIEW 2: PANEL SELECTION SCREEN
        ========================================================================== -->
-
   <div id="panelSelectView" class="auth-wrapper hidden">
     <div class="auth-card panel-select-card">
       <div class="auth-header">
@@ -64,542 +61,527 @@
         <h2>SELECT YOUR PANEL</h2>
         <p class="auth-subtitle">Logged in as: <strong id="selectCustomerDisplay" class="highlight-cyan">CUST001</strong></p>
       </div>
+      
+      <div class="panel-select-instruction">
+        Choose an assigned panel to launch live telemetry dashboard:
+      </div>
 
-  <div class="panel-select-instruction">
-    Choose an assigned panel to launch live telemetry dashboard:
-  </div>
+      <div class="panel-select-grid" id="panelSelectList">
+        <!-- Dynamically populated panel buttons -->
+      </div>
 
-  <div class="panel-select-grid" id="panelSelectList">
-    <!-- Dynamically populated panel buttons -->
-  </div>
-
-  <div class="auth-card-footer">
-    <button class="auth-secondary-btn" onclick="logoutCustomer()">
-      <i class="fa-solid fa-right-from-bracket"></i> Logout
-    </button>
-  </div>
-</div>
-
+      <div class="auth-card-footer">
+        <button class="auth-secondary-btn" onclick="logoutCustomer()">
+          <i class="fa-solid fa-right-from-bracket"></i> Logout
+        </button>
+      </div>
+    </div>
   </div>
 
   <!-- ==========================================================================
        VIEW 3: MAIN DASHBOARD VIEW
        ========================================================================== -->
-
   <div id="dashboardView" class="hidden">
 
-<!-- Top Header Navigation Bar -->
-<header class="app-header">
-  <div class="logo-area">
-    <div class="logo-icon">
-      <i class="fa-solid fa-bolt-lightning"></i>
-    </div>
-    <div>
-      <h1>SUBSTATION & POWER QUALITY DASHBOARD</h1>
-      <p class="subtitle">ABB REJ601 Relay • EMS-01 Meter • DHT22 Environmental Monitor</p>
-    </div>
-  </div>
-
-  <div class="header-controls">
-    <!-- Session Customer & Panel Info Badge -->
-    <div class="session-info-badge">
-      <div class="session-item">
-        <span class="session-lbl"><i class="fa-solid fa-user-check"></i> Customer:</span>
-        <strong id="headerCustomer" class="session-val highlight-cyan">--</strong>
-      </div>
-      <div class="session-divider">|</div>
-      <div class="session-item">
-        <span class="session-lbl"><i class="fa-solid fa-microchip"></i> Selected Panel:</span>
-        <strong id="headerPanel" class="session-val highlight-green">--</strong>
-      </div>
-    </div>
-
-    <button class="nav-btn change-panel-btn" id="changePanelBtn" onclick="changePanel()">
-      <i class="fa-solid fa-arrow-right-arrow-left"></i> Change Panel
-    </button>
-
-    <button class="nav-btn logout-btn" id="logoutBtn" onclick="logoutCustomer()">
-      <i class="fa-solid fa-right-from-bracket"></i> Logout
-    </button>
-
-    <div class="connection-status" id="connectionStatus">
-      <span class="status-dot offline"></span>
-      <span class="status-text" id="statusText">Disconnected</span>
-    </div>
-  </div>
-</header>
-
-<!-- Alert Banner Container -->
-<div class="alert-container" id="alertContainer">
-  <!-- Dynamic alerts inserted here -->
-</div>
-
-<main class="dashboard-grid">
-
-  <!-- SUMMARY OVERVIEW & SYSTEM STATUS -->
-  <section class="card summary-card span-full">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-chart-line header-icon"></i>
-        <h2>System Telemetry Summary</h2>
-      </div>
-      <div class="timestamp-badge">
-        <i class="fa-regular fa-clock"></i> <span id="lastUpdated">--:--:--</span>
-      </div>
-    </div>
-
-    <div class="summary-metrics">
-      <!-- Frequency -->
-      <div class="metric-box">
-        <span class="metric-label"><i class="fa-solid fa-wave-square"></i> Frequency</span>
-        <div class="metric-val-container">
-          <span class="metric-value highlight-cyan" id="sumFreq">--</span>
-          <span class="metric-unit">Hz</span>
+    <!-- Top Header Navigation Bar -->
+    <header class="app-header">
+      <div class="logo-area">
+        <div class="logo-icon">
+          <i class="fa-solid fa-bolt-lightning"></i>
+        </div>
+        <div>
+          <h1>SUBSTATION & POWER QUALITY DASHBOARD</h1>
+          <p class="subtitle">ABB REJ601 Relay • EMS-01 Meter • DHT22 Environmental Monitor</p>
         </div>
       </div>
 
-      <!-- Total Power -->
-      <div class="metric-box">
-        <span class="metric-label"><i class="fa-solid fa-plug-circle-bolt"></i> Total Power (P_T)</span>
-        <div class="metric-val-container">
-          <span class="metric-value highlight-green" id="sumPower">--</span>
-          <span class="metric-unit">kW</span>
-        </div>
-      </div>
-
-      <!-- Total Power Factor -->
-      <div class="metric-box">
-        <span class="metric-label"><i class="fa-solid fa-gauge-high"></i> Total Power Factor</span>
-        <div class="metric-val-container">
-          <span class="metric-value highlight-yellow" id="sumPF">--</span>
-          <span class="metric-unit"></span>
-        </div>
-      </div>
-
-      <!-- Avg Voltage -->
-      <div class="metric-box">
-        <span class="metric-label"><i class="fa-solid fa-car-battery"></i> Avg Voltage</span>
-        <div class="metric-val-container">
-          <span class="metric-value highlight-blue" id="sumAvgV">--</span>
-          <span class="metric-unit">V</span>
-        </div>
-      </div>
-
-      <!-- Temp & Hum -->
-      <div class="metric-box">
-        <span class="metric-label"><i class="fa-solid fa-temperature-half"></i> Ambient Temp / Hum</span>
-        <div class="metric-val-container">
-          <span class="metric-value highlight-orange" id="sumTemp">--</span>
-          <span class="metric-unit">°C</span>
-          <span class="metric-divider">/</span>
-          <span class="metric-value highlight-purple" id="sumHum">--</span>
-          <span class="metric-unit">%</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- SECTION 1: RELAY PROTECTION (ABB REJ601) -->
-  <section class="card relay-card">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-shield-halved header-icon"></i>
-        <h2>ABB REJ601 Protection Relay</h2>
-      </div>
-      <span class="badge badge-relay">Modbus ID: 1 • 19200 Baud</span>
-    </div>
-
-    <!-- Settings & Pickups -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-sliders"></i> Protection Settings & Active Group</div>
-      <div class="settings-grid">
-        <div class="setting-item">
-          <span class="setting-label">Active Setting Group</span>
-          <span class="setting-val" id="relaySG">SG1</span>
-        </div>
-        <div class="setting-item">
-          <span class="setting-label">Phase Pickup (I>)</span>
-          <span class="setting-val" id="relayIPhasePickup">-- A</span>
-        </div>
-        <div class="setting-item">
-          <span class="setting-label">Earth Pickup (I0>)</span>
-          <span class="setting-val" id="relayIEarthPickup">-- A</span>
-        </div>
-        <div class="setting-item">
-          <span class="setting-label">Op Counter</span>
-          <span class="setting-val" id="relayOpCounter">--</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- Live Currents -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-bolt"></i> Live Relay Currents & Sequences</div>
-      <div class="currents-grid">
-        <div class="current-card phase-1">
-          <span class="phase-name">Phase I1</span>
-          <div class="current-val-box">
-            <span class="val" id="relayI1">--</span>
-            <span class="unit">A</span>
+      <div class="header-controls">
+        <!-- Session Customer & Panel Info Badge -->
+        <div class="session-info-badge">
+          <div class="session-item">
+            <span class="session-lbl"><i class="fa-solid fa-user-check"></i> Customer:</span>
+            <strong id="headerCustomer" class="session-val highlight-cyan">--</strong>
           </div>
-          <div class="fault-status-pill" id="pillI1">Normal</div>
-        </div>
-
-        <div class="current-card phase-2">
-          <span class="phase-name">Phase I2</span>
-          <div class="current-val-box">
-            <span class="val" id="relayI2">--</span>
-            <span class="unit">A</span>
-          </div>
-          <div class="fault-status-pill" id="pillI2">Normal</div>
-        </div>
-
-        <div class="current-card phase-3">
-          <span class="phase-name">Phase I3</span>
-          <div class="current-val-box">
-            <span class="val" id="relayI3">--</span>
-            <span class="unit">A</span>
-          </div>
-          <div class="fault-status-pill" id="pillI3">Normal</div>
-        </div>
-
-        <div class="current-card phase-earth">
-          <span class="phase-name">Earth I0</span>
-          <div class="current-val-box">
-            <span class="val" id="relayI0">--</span>
-            <span class="unit">A</span>
-          </div>
-          <div class="fault-status-pill" id="pillI0">Normal</div>
-        </div>
-      </div>
-
-      <div class="extra-metrics-row">
-        <div class="extra-item">
-          <span>Negative Sequence:</span>
-          <strong id="relayNegSeq">-- A</strong>
-        </div>
-        <div class="extra-item">
-          <span>Thermal Level:</span>
-          <div class="thermal-bar-container">
-            <div class="thermal-bar-fill" id="thermalBar" style="width: 0%;"></div>
-          </div>
-          <strong id="relayThermal">-- %</strong>
-        </div>
-      </div>
-    </div>
-
-    <!-- Fault Condition Diagnosis -->
-    <div class="sub-panel fault-diagnosis-panel" id="faultDiagPanel">
-      <div class="panel-subtitle"><i class="fa-solid fa-triangle-exclamation"></i> Live Fault Status</div>
-      <div class="fault-summary-banner healthy" id="faultSummaryBanner">
-        <i class="fa-solid fa-circle-check" id="faultIcon"></i>
-        <span id="faultSummaryText">No Fault Detected</span>
-      </div>
-    </div>
-
-    <!-- Latest Event Log -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-list-check"></i> Latest Relay Event</div>
-      <div class="event-box">
-        <div><strong>Type:</strong> <span id="eventType">--</span> | <strong>Sub-Type:</strong> <span id="eventSubtype">--</span></div>
-        <div class="event-time"><i class="fa-regular fa-calendar-check"></i> <span id="eventTime">--/--/-- --:--:--.---</span></div>
-      </div>
-    </div>
-
-    <!-- Relay Date/Time -->
-    <div class="relay-rtc-footer">
-      <i class="fa-solid fa-clock-rotate-left"></i> Relay Internal RTC: <span id="relayRtc">--/--/20-- --:--:--.---</span>
-    </div>
-  </section>
-
-  <!-- SECTION 2: EMS-01 POWER QUALITY METER -->
-  <section class="card meter-card">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-gauge-high header-icon"></i>
-        <h2>EMS-01 Power Quality Meter</h2>
-      </div>
-      <span class="badge badge-meter">Modbus ID: 3 • 19200 Baud</span>
-    </div>
-
-    <!-- Voltage Readings -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-car-battery"></i> Phase Voltages (V)</div>
-      <div class="phase-metrics-grid">
-        <div class="phase-box">
-          <span class="phase-lbl color-r">V_R (Phase R)</span>
-          <div class="phase-val" id="meterVR">-- <span class="u">V</span></div>
-        </div>
-        <div class="phase-box">
-          <span class="phase-lbl color-y">V_Y (Phase Y)</span>
-          <div class="phase-val" id="meterVY">-- <span class="u">V</span></div>
-        </div>
-        <div class="phase-box">
-          <span class="phase-lbl color-b">V_B (Phase B)</span>
-          <div class="phase-val" id="meterVB">-- <span class="u">V</span></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Current & Power Table -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-table-cells"></i> Phase Telemetry & Power Distribution</div>
-      <table class="meter-table">
-        <thead>
-          <tr>
-            <th>Phase</th>
-            <th>Current (A)</th>
-            <th>Power Factor</th>
-            <th>Active Power (kW)</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><span class="color-r">Phase R</span></td>
-            <td id="meterIR">--</td>
-            <td id="meterPFR">--</td>
-            <td id="meterPR">--</td>
-          </tr>
-          <tr>
-            <td><span class="color-y">Phase Y</span></td>
-            <td id="meterIY">--</td>
-            <td id="meterPFY">--</td>
-            <td id="meterPY">--</td>
-          </tr>
-          <tr>
-            <td><span class="color-b">Phase B</span></td>
-            <td id="meterIB">--</td>
-            <td id="meterPFB">--</td>
-            <td id="meterPB">--</td>
-          </tr>
-          <tr class="total-row">
-            <td><strong>System Total</strong></td>
-            <td>--</td>
-            <td id="meterPFT"><strong>--</strong></td>
-            <td id="meterPT"><strong>-- kW</strong></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <!-- Grid Frequency -->
-    <div class="sub-panel">
-      <div class="freq-box">
-        <span><i class="fa-solid fa-wave-square"></i> Grid Frequency:</span>
-        <span class="freq-val" id="meterFreq">-- Hz</span>
-      </div>
-    </div>
-  </section>
-
-  <!-- SECTION 3: ENVIRONMENTAL MONITOR & FAULT RECORD -->
-  <section class="card env-card-panel">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-temperature-arrow-up header-icon"></i>
-        <h2>Environmental & Fault Record</h2>
-      </div>
-      <span class="badge badge-dht">DHT22 & Fault Logs</span>
-    </div>
-
-    <!-- Ambient DHT22 -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-house-signal"></i> Ambient Environment (DHT22)</div>
-      <div class="env-grid">
-        <div class="env-card">
-          <div class="env-icon icon-temp"><i class="fa-solid fa-temperature-half"></i></div>
-          <div class="env-info">
-            <span class="env-title">Temperature</span>
-            <div><span class="env-val" id="dhtTemp">--</span> <span class="env-unit">°C</span></div>
-            <span class="env-limit">Threshold: &gt; 50.0 °C</span>
-          </div>
-          <div class="env-alert-badge hidden" id="tempAlertBadge">HIGH</div>
-        </div>
-
-        <div class="env-card">
-          <div class="env-icon icon-hum"><i class="fa-solid fa-droplet"></i></div>
-          <div class="env-info">
-            <span class="env-title">Humidity</span>
-            <div><span class="env-val" id="dhtHum">--</span> <span class="env-unit">%</span></div>
-            <span class="env-limit">Threshold: &gt; 80.0 %</span>
-          </div>
-          <div class="env-alert-badge hidden" id="humAlertBadge">HIGH</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Fault Record 1 Timeline -->
-    <div class="sub-panel">
-      <div class="panel-subtitle"><i class="fa-solid fa-clock-rotate-left"></i> Latest Fault Record Timeline (Relay)</div>
-      <div class="fault-record-container">
-        <!-- Stage 1: At Start -->
-        <div class="record-stage">
-          <div class="stage-header-row">
-            <span class="stage-title"><i class="fa-solid fa-play"></i> At Start</span>
-            <span class="stage-time" id="frStageStart_time">--:--:--</span>
-          </div>
-          <div class="stage-currents" id="frStageStart">I1: -- A | I2: -- A | I3: -- A | I0: -- A</div>
-        </div>
-
-        <!-- Stage 2: At Trip -->
-        <div class="record-stage trip-stage">
-          <div class="stage-header-row">
-            <span class="stage-title"><i class="fa-solid fa-skull-crossbones"></i> At Trip</span>
-            <span class="stage-time" id="frStageTrip_time">--:--:--</span>
-          </div>
-          <div class="stage-currents" id="frStageTrip">I1: -- A | I2: -- A | I3: -- A | I0: -- A</div>
-        </div>
-
-        <!-- Stage 3: +80% Post Trip -->
-        <div class="record-stage">
-          <div class="stage-header-row">
-            <span class="stage-title"><i class="fa-solid fa-forward-step"></i> +80% Post Trip</span>
-            <span class="stage-time" id="frStagePost80_time">--:--:--</span>
-          </div>
-          <div class="stage-currents" id="frStagePost80">I1: -- A | I2: -- A | I3: -- A | I0: -- A</div>
-        </div>
-
-        <!-- Stage 4: +200% Post Trip -->
-        <div class="record-stage">
-          <div class="stage-header-row">
-            <span class="stage-title"><i class="fa-solid fa-forward-fast"></i> +200% Post Trip</span>
-            <span class="stage-time" id="frStagePost200_time">--:--:--</span>
-          </div>
-          <div class="stage-currents" id="frStagePost200">I1: -- A | I2: -- A | I3: -- A | I0: -- A</div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- SECTION 4: REAL-TIME TELEMETRY CHARTS -->
-  <section class="card chart-card span-full">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-chart-area header-icon"></i>
-        <h2>Real-Time Live Telemetry Trends</h2>
-      </div>
-      <div class="chart-controls">
-        <button class="chart-tab active" id="chartTabTelemetry" onclick="switchChartTab('telemetry')">Currents (I1-I3)</button>
-        <button class="chart-tab" id="chartTabVoltages" onclick="switchChartTab('voltages')">Voltages (VR-VB)</button>
-        <button class="chart-tab" id="chartTabClimate" onclick="switchChartTab('climate')">Climate (Temp/Hum)</button>
-      </div>
-    </div>
-    <div class="chart-wrapper">
-      <canvas id="telemetryChart"></canvas>
-    </div>
-  </section>
-
-  <!-- SECTION 5: HISTORICAL DATA LOGS & EXPORT -->
-  <section class="card hist-card span-full">
-    <div class="card-header">
-      <div class="card-title">
-        <i class="fa-solid fa-database header-icon"></i>
-        <h2>Historical Data Records & Analytics</h2>
-      </div>
-      <span class="badge">PostgreSQL Log Store</span>
-    </div>
-
-    <div class="sub-panel">
-      <div class="hist-controls-grid">
-        <!-- Date Filters -->
-        <div class="date-range-inputs">
-          <div class="input-item">
-            <label for="histStartDate"><i class="fa-regular fa-calendar"></i> Start Date & Time</label>
-            <input type="datetime-local" id="histStartDate">
-          </div>
-          <div class="input-item">
-            <label for="histEndDate"><i class="fa-regular fa-calendar-check"></i> End Date & Time</label>
-            <input type="datetime-local" id="histEndDate">
+          <div class="session-divider">|</div>
+          <div class="session-item">
+            <span class="session-lbl"><i class="fa-solid fa-microchip"></i> Selected Panel:</span>
+            <strong id="headerPanel" class="session-val highlight-green">--</strong>
           </div>
         </div>
 
-        <!-- Export Column Checkboxes -->
-        <div class="export-checkboxes">
-          <div class="panel-subtitle" style="margin-bottom: 6px;"><i class="fa-solid fa-filter"></i> Include In Export</div>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkRelay" checked>
-            <span>ABB REJ601 Relay Currents & Pickups</span>
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkMeter" checked>
-            <span>EMS-01 Meter Voltages, Power & PF</span>
-          </label>
-          <label class="checkbox-container">
-            <input type="checkbox" id="chkDht" checked>
-            <span>DHT22 Temperature & Humidity</span>
-          </label>
-        </div>
+        <button class="nav-btn change-panel-btn" id="changePanelBtn" onclick="changePanel()">
+          <i class="fa-solid fa-arrow-right-arrow-left"></i> Change Panel
+        </button>
 
-        <!-- Action Buttons -->
-        <div class="hist-action-buttons">
-          <button class="action-btn filter-btn" id="histSearchBtn" onclick="searchHistoricalData()">
-            <i class="fa-solid fa-magnifying-glass"></i> Search Logs
-          </button>
-          <button class="action-btn refresh-btn" id="histRefreshBtn" onclick="resetHistoricalFilter()">
-            <i class="fa-solid fa-rotate"></i> Reset Filter
-          </button>
-          <button class="action-btn download-btn" id="histExportExcelBtn" onclick="exportHistoricalExcel()">
-            <i class="fa-solid fa-file-excel"></i> Export Excel
-          </button>
-          <button class="action-btn download-btn" id="histExportPdfBtn" style="background: linear-gradient(135deg, #ef4444, #b91c1c);" onclick="exportHistoricalPdf()">
-            <i class="fa-solid fa-file-pdf"></i> Export PDF
-          </button>
-          <button class="action-btn clear-btn span-full" id="histClearBtn" style="grid-column: 1 / -1;" onclick="clearHistoricalTable()">
-            <i class="fa-solid fa-trash-can"></i> Clear Table View
-          </button>
+        <button class="nav-btn logout-btn" id="logoutBtn" onclick="logoutCustomer()">
+          <i class="fa-solid fa-right-from-bracket"></i> Logout
+        </button>
+
+        <div class="connection-status" id="connectionStatus">
+          <span class="status-dot offline"></span>
+          <span class="status-text" id="statusText">Disconnected</span>
         </div>
       </div>
+    </header>
+
+    <!-- Alert Banner Container -->
+    <div class="alert-container" id="alertContainer">
+      <!-- Dynamic alerts inserted here -->
     </div>
 
-    <!-- Table Container -->
-    <div class="sub-panel" style="overflow-x: auto;">
-      <div class="panel-subtitle" style="display: flex; justify-content: space-between;">
-        <span><i class="fa-solid fa-table"></i> Historical Records (<span id="histRecordCount">0</span> records found)</span>
-        <span style="font-size: 0.75rem; color: var(--text-dim);">Auto-filtered for: <strong id="histPanelFilterBadge" class="highlight-cyan">PANEL001</strong></span>
-      </div>
-      <table class="meter-table hist-table">
-        <thead>
-          <tr>
-            <th>Timestamp</th>
-            <th>Panel ID</th>
-            <th>Fault Status</th>
-            <th>I1 (A)</th>
-            <th>I2 (A)</th>
-            <th>I3 (A)</th>
-            <th>I0 (A)</th>
-            <th>V_R (V)</th>
-            <th>V_Y (V)</th>
-            <th>V_B (V)</th>
-            <th>Total Power (kW)</th>
-            <th>Total PF</th>
-            <th>Temp (°C)</th>
-            <th>Hum (%)</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody id="histTableBody">
-          <tr>
-            <td colspan="15" style="text-align: center; color: var(--text-dim); padding: 20px;">
-              No historical records loaded. Select a date range and click "Search Logs".
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
+    <main class="dashboard-grid">
 
-</main>
+      <!-- SUMMARY OVERVIEW & SYSTEM STATUS -->
+      <section class="card summary-card span-full">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-chart-line header-icon"></i>
+            <h2>System Telemetry Summary</h2>
+          </div>
+          <div class="timestamp-badge">
+            <i class="fa-regular fa-clock"></i> <span id="lastUpdated">--:--:--</span>
+          </div>
+        </div>
 
-<!-- App Footer -->
-<footer class="app-footer">
-  <p>MV Substation Panel Telemetry System • ABB REJ601 & EMS-01 Power Quality Suite • Version 3.2</p>
-</footer>
+        <div class="summary-metrics">
+          <!-- Frequency -->
+          <div class="metric-box">
+            <span class="metric-label"><i class="fa-solid fa-wave-square"></i> Frequency</span>
+            <div class="metric-val-container">
+              <span class="metric-value highlight-cyan" id="sumFreq">--</span>
+              <span class="metric-unit">Hz</span>
+            </div>
+          </div>
+
+          <!-- Total Power -->
+          <div class="metric-box">
+            <span class="metric-label"><i class="fa-solid fa-plug-circle-bolt"></i> Total Power (P_T)</span>
+            <div class="metric-val-container">
+              <span class="metric-value highlight-green" id="sumPower">--</span>
+              <span class="metric-unit">kW</span>
+            </div>
+          </div>
+
+          <!-- Total Power Factor -->
+          <div class="metric-box">
+            <span class="metric-label"><i class="fa-solid fa-gauge-high"></i> Total Power Factor</span>
+            <div class="metric-val-container">
+              <span class="metric-value highlight-yellow" id="sumPF">--</span>
+              <span class="metric-unit"></span>
+            </div>
+          </div>
+
+          <!-- Avg Voltage -->
+          <div class="metric-box">
+            <span class="metric-label"><i class="fa-solid fa-car-battery"></i> Avg Voltage</span>
+            <div class="metric-val-container">
+              <span class="metric-value highlight-blue" id="sumAvgV">--</span>
+              <span class="metric-unit">V</span>
+            </div>
+          </div>
+
+          <!-- Temp & Hum -->
+          <div class="metric-box">
+            <span class="metric-label"><i class="fa-solid fa-temperature-half"></i> Ambient Temp / Hum</span>
+            <div class="metric-val-container">
+              <span class="metric-value highlight-orange" id="sumTemp">--</span>
+              <span class="metric-unit">°C</span>
+              <span class="metric-divider">/</span>
+              <span class="metric-value highlight-purple" id="sumHum">--</span>
+              <span class="metric-unit">%</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 1: RELAY PROTECTION (ABB REJ601) -->
+      <section class="card relay-card">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-shield-halved header-icon"></i>
+            <h2>ABB REJ601 Protection Relay</h2>
+          </div>
+          <span class="badge badge-relay">Modbus ID: 1 • 19200 Baud</span>
+        </div>
+
+        <!-- Settings & Pickups -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-sliders"></i> Protection Settings & Active Group</div>
+          <div class="settings-grid">
+            <div class="setting-item">
+              <span class="setting-label">Active Setting Group</span>
+              <span class="setting-val" id="relaySG">SG1</span>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Phase Pickup (I>)</span>
+              <span class="setting-val" id="relayIPhasePickup">-- A</span>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Earth Pickup (I0>)</span>
+              <span class="setting-val" id="relayIEarthPickup">-- A</span>
+            </div>
+            <div class="setting-item">
+              <span class="setting-label">Op Counter</span>
+              <span class="setting-val" id="relayOpCounter">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live Currents -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-bolt"></i> Live Relay Currents & Sequences</div>
+          <div class="currents-grid">
+            <div class="current-card phase-1">
+              <span class="phase-name">Phase I1</span>
+              <div class="current-val-box">
+                <span class="val" id="relayI1">--</span>
+                <span class="unit">A</span>
+              </div>
+              <div class="fault-status-pill" id="pillI1">Normal</div>
+            </div>
+
+            <div class="current-card phase-2">
+              <span class="phase-name">Phase I2</span>
+              <div class="current-val-box">
+                <span class="val" id="relayI2">--</span>
+                <span class="unit">A</span>
+              </div>
+              <div class="fault-status-pill" id="pillI2">Normal</div>
+            </div>
+
+            <div class="current-card phase-3">
+              <span class="phase-name">Phase I3</span>
+              <div class="current-val-box">
+                <span class="val" id="relayI3">--</span>
+                <span class="unit">A</span>
+              </div>
+              <div class="fault-status-pill" id="pillI3">Normal</div>
+            </div>
+
+            <div class="current-card phase-earth">
+              <span class="phase-name">Earth I0</span>
+              <div class="current-val-box">
+                <span class="val" id="relayI0">--</span>
+                <span class="unit">A</span>
+              </div>
+              <div class="fault-status-pill" id="pillI0">Normal</div>
+            </div>
+          </div>
+
+          <div class="extra-metrics-row">
+            <div class="extra-item">
+              <span>Negative Sequence:</span>
+              <strong id="relayNegSeq">-- A</strong>
+            </div>
+            <div class="extra-item">
+              <span>Thermal Level:</span>
+              <div class="thermal-bar-container">
+                <div class="thermal-bar-fill" id="thermalBar" style="width: 0%;"></div>
+              </div>
+              <strong id="relayThermal">-- %</strong>
+            </div>
+          </div>
+        </div>
+
+        <!-- Fault Condition Diagnosis -->
+        <div class="sub-panel fault-diagnosis-panel" id="faultDiagPanel">
+          <div class="panel-subtitle"><i class="fa-solid fa-triangle-exclamation"></i> Live Fault Status</div>
+          <div class="fault-summary-banner healthy" id="faultSummaryBanner">
+            <i class="fa-solid fa-circle-check" id="faultIcon"></i>
+            <span id="faultSummaryText">No Fault Detected</span>
+          </div>
+        </div>
+
+        <!-- Latest Event Log -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-list-check"></i> Latest Relay Event</div>
+          <div class="event-box">
+            <div><strong>Type:</strong> <span id="eventType">--</span> | <strong>Sub-Type:</strong> <span id="eventSubtype">--</span></div>
+            <div class="event-time"><i class="fa-regular fa-calendar-check"></i> <span id="eventTime">--/--/-- --:--:--.---</span></div>
+          </div>
+        </div>
+
+        <!-- Relay Date/Time -->
+        <div class="relay-rtc-footer">
+          <i class="fa-solid fa-clock-rotate-left"></i> Relay Internal RTC: <span id="relayRtc">--/--/20-- --:--:--.---</span>
+        </div>
+      </section>
+
+      <!-- SECTION 2: EMS-01 POWER QUALITY METER -->
+      <section class="card meter-card">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-gauge-high header-icon"></i>
+            <h2>EMS-01 Power Quality Meter</h2>
+          </div>
+          <span class="badge badge-meter">Modbus ID: 3 • 19200 Baud</span>
+        </div>
+
+        <!-- Voltage Readings -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-car-battery"></i> Phase Voltages (V)</div>
+          <div class="phase-metrics-grid">
+            <div class="phase-box">
+              <span class="phase-lbl color-r">V_R (Phase R)</span>
+              <div class="phase-val" id="meterVR">-- <span class="u">V</span></div>
+            </div>
+            <div class="phase-box">
+              <span class="phase-lbl color-y">V_Y (Phase Y)</span>
+              <div class="phase-val" id="meterVY">-- <span class="u">V</span></div>
+            </div>
+            <div class="phase-box">
+              <span class="phase-lbl color-b">V_B (Phase B)</span>
+              <div class="phase-val" id="meterVB">-- <span class="u">V</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Current & Power Table -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-table-cells"></i> Phase Telemetry & Power Distribution</div>
+          <table class="meter-table">
+            <thead>
+              <tr>
+                <th>Phase</th>
+                <th>Current (A)</th>
+                <th>Power Factor</th>
+                <th>Active Power (kW)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="color-r">Phase R</span></td>
+                <td id="meterIR">--</td>
+                <td id="meterPFR">--</td>
+                <td id="meterPR">--</td>
+              </tr>
+              <tr>
+                <td><span class="color-y">Phase Y</span></td>
+                <td id="meterIY">--</td>
+                <td id="meterPFY">--</td>
+                <td id="meterPY">--</td>
+              </tr>
+              <tr>
+                <td><span class="color-b">Phase B</span></td>
+                <td id="meterIB">--</td>
+                <td id="meterPFB">--</td>
+                <td id="meterPB">--</td>
+              </tr>
+              <tr class="total-row">
+                <td><strong>System Total</strong></td>
+                <td>--</td>
+                <td id="meterPFT"><strong>--</strong></td>
+                <td id="meterPT"><strong>-- kW</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Grid Frequency -->
+        <div class="sub-panel">
+          <div class="freq-box">
+            <span><i class="fa-solid fa-wave-square"></i> Grid Frequency:</span>
+            <span class="freq-val" id="meterFreq">-- Hz</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 3: ENVIRONMENTAL MONITOR & FAULT RECORD -->
+      <section class="card env-card-panel">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-temperature-arrow-up header-icon"></i>
+            <h2>Environmental & Fault Record</h2>
+          </div>
+          <span class="badge badge-dht">DHT22 & Fault Logs</span>
+        </div>
+
+        <!-- Ambient DHT22 -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-house-signal"></i> Ambient Environment (DHT22)</div>
+          <div class="env-grid">
+            <div class="env-card">
+              <div class="env-icon icon-temp"><i class="fa-solid fa-temperature-half"></i></div>
+              <div class="env-info">
+                <span class="env-title">Temperature</span>
+                <div><span class="env-val" id="dhtTemp">--</span> <span class="env-unit">°C</span></div>
+                <span class="env-limit">Threshold: &gt; 50.0 °C</span>
+              </div>
+              <div class="env-alert-badge hidden" id="tempAlertBadge">HIGH</div>
+            </div>
+
+            <div class="env-card">
+              <div class="env-icon icon-hum"><i class="fa-solid fa-droplet"></i></div>
+              <div class="env-info">
+                <span class="env-title">Humidity</span>
+                <div><span class="env-val" id="dhtHum">--</span> <span class="env-unit">%</span></div>
+                <span class="env-limit">Threshold: &gt; 80.0 %</span>
+              </div>
+              <div class="env-alert-badge hidden" id="humAlertBadge">HIGH</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Fault Record 1 Timeline -->
+        <div class="sub-panel">
+          <div class="panel-subtitle"><i class="fa-solid fa-clock-rotate-left"></i> Latest Fault Record Timeline (Relay)</div>
+          <div class="fault-record-container">
+            <!-- Stage 1: Pre-Start -->
+            <div class="record-stage">
+              <div class="stage-header-row">
+                <span class="stage-title"><i class="fa-solid fa-backward"></i> Pre-Start</span>
+                <span class="stage-time" id="frStagePreStart_time">--:--:--</span>
+              </div>
+              <div class="stage-currents" id="frStagePreStart">I1=-- A | I2=-- A | I3=-- A | I0=-- A</div>
+            </div>
+
+            <!-- Stage 2: At Start -->
+            <div class="record-stage">
+              <div class="stage-header-row">
+                <span class="stage-title"><i class="fa-solid fa-play"></i> At Start</span>
+                <span class="stage-time" id="frStageStart_time">--:--:--</span>
+              </div>
+              <div class="stage-currents" id="frStageStart">I1=-- A | I2=-- A | I3=-- A | I0=-- A</div>
+            </div>
+
+            <!-- Stage 3: At Trip -->
+            <div class="record-stage trip-stage">
+              <div class="stage-header-row">
+                <span class="stage-title"><i class="fa-solid fa-skull-crossbones"></i> At Trip</span>
+                <span class="stage-time" id="frStageTrip_time">--:--:--</span>
+              </div>
+              <div class="stage-currents" id="frStageTrip">I1=-- A | I2=-- A | I3=-- A | I0=-- A</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 4: REAL-TIME TELEMETRY CHARTS -->
+      <section class="card chart-card span-full">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-chart-area header-icon"></i>
+            <h2>Real-Time Live Telemetry Trends</h2>
+          </div>
+          <div class="chart-controls">
+            <button class="chart-tab active" id="chartTabTelemetry" onclick="switchChartTab('telemetry')">Currents (I1-I3)</button>
+            <button class="chart-tab" id="chartTabVoltages" onclick="switchChartTab('voltages')">Voltages (VR-VB)</button>
+            <button class="chart-tab" id="chartTabClimate" onclick="switchChartTab('climate')">Climate (Temp/Hum)</button>
+          </div>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="telemetryChart"></canvas>
+        </div>
+      </section>
+
+      <!-- SECTION 5: HISTORICAL DATA LOGS & EXPORT -->
+      <section class="card hist-card span-full">
+        <div class="card-header">
+          <div class="card-title">
+            <i class="fa-solid fa-database header-icon"></i>
+            <h2>Historical Data Records & Analytics</h2>
+          </div>
+          <span class="badge">PostgreSQL Log Store</span>
+        </div>
+
+        <div class="sub-panel">
+          <div class="hist-controls-grid">
+            <!-- Date Filters -->
+            <div class="date-range-inputs">
+              <div class="input-item">
+                <label for="histStartDate"><i class="fa-regular fa-calendar"></i> Start Date & Time</label>
+                <input type="datetime-local" id="histStartDate">
+              </div>
+              <div class="input-item">
+                <label for="histEndDate"><i class="fa-regular fa-calendar-check"></i> End Date & Time</label>
+                <input type="datetime-local" id="histEndDate">
+              </div>
+            </div>
+
+            <!-- Export Column Checkboxes -->
+            <div class="export-checkboxes">
+              <div class="panel-subtitle" style="margin-bottom: 6px;"><i class="fa-solid fa-filter"></i> Include In Export</div>
+              <label class="checkbox-container">
+                <input type="checkbox" id="chkRelay" checked>
+                <span>ABB REJ601 Relay Currents & Pickups</span>
+              </label>
+              <label class="checkbox-container">
+                <input type="checkbox" id="chkMeter" checked>
+                <span>EMS-01 Meter Voltages, Power & PF</span>
+              </label>
+              <label class="checkbox-container">
+                <input type="checkbox" id="chkDht" checked>
+                <span>DHT22 Temperature & Humidity</span>
+              </label>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="hist-action-buttons">
+              <button class="action-btn filter-btn" id="histSearchBtn" onclick="searchHistoricalData()">
+                <i class="fa-solid fa-magnifying-glass"></i> Search Logs
+              </button>
+              <button class="action-btn refresh-btn" id="histRefreshBtn" onclick="resetHistoricalFilter()">
+                <i class="fa-solid fa-rotate"></i> Reset Filter
+              </button>
+              <button class="action-btn download-btn" id="histExportExcelBtn" onclick="exportHistoricalExcel()">
+                <i class="fa-solid fa-file-excel"></i> Export Excel
+              </button>
+              <button class="action-btn download-btn" id="histExportPdfBtn" style="background: linear-gradient(135deg, #ef4444, #b91c1c);" onclick="exportHistoricalPdf()">
+                <i class="fa-solid fa-file-pdf"></i> Export PDF
+              </button>
+              <button class="action-btn clear-btn span-full" id="histClearBtn" style="grid-column: 1 / -1;" onclick="clearHistoricalTable()">
+                <i class="fa-solid fa-trash-can"></i> Clear Table View
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Table Container -->
+        <div class="sub-panel" style="overflow-x: auto;">
+          <div class="panel-subtitle" style="display: flex; justify-content: space-between;">
+            <span><i class="fa-solid fa-table"></i> Historical Records (<span id="histRecordCount">0</span> records found)</span>
+            <span style="font-size: 0.75rem; color: var(--text-dim);">Auto-filtered for: <strong id="histPanelFilterBadge" class="highlight-cyan">PANEL001</strong></span>
+          </div>
+          <table class="meter-table hist-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Panel ID</th>
+                <th>Fault Status</th>
+                <th>I1 (A)</th>
+                <th>I2 (A)</th>
+                <th>I3 (A)</th>
+                <th>I0 (A)</th>
+                <th>V_R (V)</th>
+                <th>V_Y (V)</th>
+                <th>V_B (V)</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="histTableBody">
+              <tr>
+                <td colspan="11" style="text-align: center; color: var(--text-dim); padding: 20px;">
+                  No historical records loaded. Select a date range and click "Search Logs".
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- App Footer -->
+    <footer class="app-footer">
+      <p>MV Substation Panel Telemetry System • ABB REJ601 & EMS-01 Power Quality Suite • Version 3.2</p>
+    </footer>
 
   </div> <!-- End #dashboardView -->
+
 
   <!-- ==========================================================================
        MODAL: VIEW DETAILS (Historical Record Popup)
        ========================================================================== -->
-
   <div class="modal-overlay hidden" id="recordDetailsModal">
     <div class="modal-box">
       <div class="modal-header">
@@ -612,20 +594,24 @@
         </button>
       </div>
 
-  <div class="modal-body" id="modalBody">
-    <!-- Dynamically rendered record detail cards -->
-  </div>
+      <div class="modal-body" id="modalBody">
+        <!-- Dynamically rendered record detail cards -->
+      </div>
 
-  <div class="modal-footer">
-    <button class="action-btn reset-btn" onclick="closeDetailsModal()">
-      <i class="fa-solid fa-check"></i> Close Snapshot
-    </button>
-  </div>
-</div>
-
+      <div class="modal-footer">
+        <button class="action-btn download-btn" id="modalDownloadExcelBtn" onclick="exportSingleRecordExcel()">
+          <i class="fa-solid fa-file-excel"></i> Download Excel
+        </button>
+        <button class="action-btn download-btn" id="modalDownloadPdfBtn" style="background: linear-gradient(135deg, #ef4444, #b91c1c);" onclick="exportSingleRecordPdf()">
+          <i class="fa-solid fa-file-pdf"></i> Download PDF
+        </button>
+        <button class="action-btn reset-btn" onclick="closeDetailsModal()">
+          <i class="fa-solid fa-check"></i> Close Snapshot
+        </button>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>
-
 </body>
 </html>
