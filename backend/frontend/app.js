@@ -1,1359 +1,894 @@
 /* ==========================================================================
-   Substation Live Dashboard - Real-time Application Logic
-   Architecture: ESP32 -> FastAPI -> PostgreSQL -> Dashboard
-   Live data source: FastAPI GET /latest (polled every 2s)
-   Historical data source: FastAPI GET /history and DELETE /history
+   Substation & Power Quality Live Dashboard - Script
    ========================================================================== */
 
-// ==========================================================================
-// Backend API Configuration
-// (Later this base URL will change to the deployed Render URL - nothing else
-//  in this file needs to change when that happens)
-// ==========================================================================
-const API_BASE_URL = "https://mv-panel-monitoring-system.onrender.com";
+// --------------------------------------------------------------------------
+// 1. CONFIGURATION & STATE MANAGEMENT
+// --------------------------------------------------------------------------
+
+const API_BASE_URL = "https://mv-panel-monitoring-system-qobz.onrender.com";
 const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
 const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
-const DELETE_HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
-const POLL_INTERVAL_MS = 2000;
 
-let pollIntervalHandle = null;
-
-let chartInstance = null;
-let activeChartMode = 'currents'; // 'currents' | 'voltages' | 'environment'
-
-// State for live vs historical charting
-let isShowingHistorical = false;
-
-// Holds only the records currently displayed in the historical table,
-// used as the source for Excel/PDF export ("export only what's displayed")
-// and also as the source for the "View Details" modal (Section: NEW FEATURE).
-let currentHistoricalRecords = [];
-
-// Helper function to check for null, undefined, or NaN safely
-function isInvalid(val) {
-  return val === null || val === undefined || isNaN(Number(val));
-}
-
-// -----------------------------------------------------------------------
-// Shared fault-text classifier.
-// The backend's derive_fault_status() (main.py) is the ONLY place fault
-// message text is defined. It always sends one of exactly three canonical
-// strings, used verbatim and unmodified everywhere in this file:
-//   "No Fault Detected"
-//   "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
-//   "Fault Detected - E/F (Single Line Earth Fault Current)"
-// This file never constructs, hardcodes, or rewords a fault message - it
-// only displays fault_status / live_fault_status / historical_fault_status
-// exactly as received from the API.
-// IMPORTANT: this must NOT be a plain substring check for "fault detected" -
-// "No Fault Detected" also contains that substring, which previously caused
-// the healthy state to be misclassified as faulted. Checking the prefix
-// avoids that.
-// -----------------------------------------------------------------------
-function isActiveFault(faultStatusText) {
-  return String(faultStatusText || '').trim().toLowerCase().startsWith('fault detected');
-}
-
-// -----------------------------------------------------------------------
-// Fault-aware relay current resolver.
-//
-// IMPORTANT - SCOPE: this resolver is used by every part of the app that
-// displays a HISTORICAL row's relay current: the Historical Records
-// table, the historical chart, the bulk history export, the View
-// Details -> "Relay Currents" section, and the single-record export
-// (which mirrors that modal section). Using the same resolver in all of
-// these guarantees they can never disagree with each other for a given
-// row.
-//
-// It must NEVER be used for the Live Dashboard - relay.i1/i2/i3/i0 from
-// /latest are always the genuine live relay readings and must be shown
-// as-is, regardless of fault state.
-//
-// It is also NOT used by the View Details -> "Fault Record" section,
-// which intentionally reads fr_attrip_* (and fr_prestart_*/fr_atstart_*/
-// fr_p80_*/fr_p200_*) directly and unconditionally - that section is the
-// relay's permanent record of the trip event itself, independent of
-// which value this resolver chooses to show in "Relay Currents".
-//
-// The backend (/history in main.py) does NOT pre-resolve relay_i1..i0 -
-// it always returns the raw relay reading for that row, plus the row's
-// own fr_attrip_* fields, unconditionally. This function is what applies
-// the "use fr_attrip_* on a faulted row" rule on the frontend:
-//
-//   If overcurrent_fault or earth_fault is true (for THIS row only):
-//     use fr_attrip_i1 / fr_attrip_i2 / fr_attrip_i3 / fr_attrip_i0
-//   Otherwise:
-//     use relay_i1 / relay_i2 / relay_i3 / relay_i0
-// -----------------------------------------------------------------------
-function resolveRelayCurrents(record) {
-  if (record && (record.overcurrent_fault || record.earth_fault)) {
-    return {
-      i1: record.fr_attrip_i1,
-      i2: record.fr_attrip_i2,
-      i3: record.fr_attrip_i3,
-      i0: record.fr_attrip_i0,
-    };
+// Customer Accounts & Assigned Panels Configuration (Frontend Auth Demo)
+const customerAccounts = {
+  "CUST001": {
+    panels: ["PANEL001", "PANEL002", "PANEL003"]
+  },
+  "CUST002": {
+    panels: ["PANEL003"]
   }
-  return {
-    i1: record ? record.relay_i1 : null,
-    i2: record ? record.relay_i2 : null,
-    i3: record ? record.relay_i3 : null,
-    i0: record ? record.relay_i0 : null,
-  };
-}
-
-// Live chart telemetry buffer (last 20 samples)
-const chartDataBuffer = {
-  timestamps: [],
-  i1: [], i2: [], i3: [], i0: [],
-  vr: [], vy: [], vb: [],
-  temp: [], hum: []
 };
 
-// ==========================================================================
-// IndexedDB Setup - retained ONLY for temporary browser caching of live
-// telemetry. It is no longer used as the source for historical records;
-// all historical queries go through FastAPI -> PostgreSQL (GET/DELETE /history).
-// ==========================================================================
-const dbName = "SubstationTelemetryDB";
-const storeName = "telemetry";
-let db = null;
+let currentCustomer = null;   // Active logged-in customer ID (e.g. "CUST001")
+let selectedPanelId = null;   // Active selected panel ID (e.g. "PANEL001")
+let livePollingInterval = null;
 
-function initDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(dbName, 1);
-    request.onupgradeneeded = (e) => {
-      const database = e.target.result;
-      if (!database.objectStoreNames.contains(storeName)) {
-        database.createObjectStore(storeName, { keyPath: "timestamp" });
+// Telemetry & Chart State
+let telemetryChartInstance = null;
+let activeChartTab = "telemetry";
+let chartHistoryData = [];
+let currentHistoricalRecords = [];
+
+// --------------------------------------------------------------------------
+// 2. AUTHENTICATION & VIEW NAVIGATION
+// --------------------------------------------------------------------------
+
+function showView(viewId) {
+  const views = ['loginView', 'panelSelectView', 'dashboardView'];
+  views.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      if (id === viewId) {
+        el.classList.remove('hidden');
+      } else {
+        el.classList.add('hidden');
       }
-    };
-    request.onsuccess = (e) => {
-      db = e.target.result;
-      console.log("IndexedDB initialized successfully (temporary local cache).");
-      resolve(db);
-    };
-    request.onerror = (e) => {
-      console.error("IndexedDB initialization error:", e.target.error);
-      reject(e.target.error);
-    };
+    }
   });
 }
 
-function saveTelemetryToDB(data) {
-  if (!db) return;
-  const transaction = db.transaction([storeName], "readwrite");
-  const store = transaction.objectStore(storeName);
-
-  const record = {
-    timestamp: new Date().toISOString(),
-    i1: isInvalid(data.relay?.i1) ? null : Number(data.relay.i1),
-    i2: isInvalid(data.relay?.i2) ? null : Number(data.relay.i2),
-    i3: isInvalid(data.relay?.i3) ? null : Number(data.relay.i3),
-    i0: isInvalid(data.relay?.i0) ? null : Number(data.relay.i0),
-    vr: isInvalid(data.meter?.v_r) ? null : Number(data.meter.v_r),
-    vy: isInvalid(data.meter?.v_y) ? null : Number(data.meter.v_y),
-    vb: isInvalid(data.meter?.v_b) ? null : Number(data.meter.v_b),
-    freq: isInvalid(data.meter?.frequency) ? null : Number(data.meter.frequency),
-    temp: isInvalid(data.dht?.temperature) ? null : Number(data.dht.temperature),
-    hum: isInvalid(data.dht?.humidity) ? null : Number(data.dht.humidity),
-    pf_t: isInvalid(data.meter?.pf_t) ? null : Number(data.meter.pf_t),
-    p_t: isInvalid(data.meter?.p_t) ? null : Number(data.meter.p_t),
-  };
-
-  store.put(record);
+function showLoginScreen() {
+  stopLivePolling();
+  const errorMsg = document.getElementById('loginErrorMessage');
+  if (errorMsg) errorMsg.classList.add('hidden');
+  showView('loginView');
 }
 
-// Initialize app when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-  initChart();
-  updateTimestamp();
+function loginCustomer() {
+  const custIdInput = document.getElementById('loginCustomerId');
+  const errorMsg = document.getElementById('loginErrorMessage');
+  const errorText = document.getElementById('loginErrorText');
 
-  // Initialize local cache DB, then start polling FastAPI for live telemetry
-  initDB().then(() => {
-    startLivePolling();
-  }).catch(() => {
-    // Even if IndexedDB fails, live polling should still work
-    startLivePolling();
-  });
-});
+  const custId = custIdInput ? custIdInput.value.trim().toUpperCase() : '';
 
-// Update top header timestamp
-function updateTimestamp() {
-  const now = new Date();
-  const timeStr = now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
-  document.getElementById('lastUpdated').innerText = timeStr;
+  if (errorMsg) errorMsg.classList.add('hidden');
+
+  if (!custId) {
+    if (errorText) errorText.textContent = "Please enter a Customer ID";
+    if (errorMsg) errorMsg.classList.remove('hidden');
+    return;
+  }
+
+  const account = customerAccounts[custId];
+  if (account) {
+    // Login Successful
+    currentCustomer = custId;
+    localStorage.setItem('mv_customer_id', custId);
+    showPanelSelection();
+  } else {
+    // Invalid Credentials
+    if (errorText) errorText.textContent = "Invalid Customer ID";
+    if (errorMsg) errorMsg.classList.remove('hidden');
+  }
 }
 
-function setConnectionState(state, text) {
-  const dot = document.querySelector('.status-dot');
-  const txt = document.getElementById('statusText');
-  dot.className = `status-dot ${state}`;
-  txt.innerText = text;
+function showPanelSelection() {
+  stopLivePolling();
+  if (!currentCustomer || !customerAccounts[currentCustomer]) {
+    showLoginScreen();
+    return;
+  }
+
+  const selectCustDisplay = document.getElementById('selectCustomerDisplay');
+  if (selectCustDisplay) selectCustDisplay.textContent = currentCustomer;
+
+  const panelSelectList = document.getElementById('panelSelectList');
+  if (panelSelectList) {
+    panelSelectList.innerHTML = '';
+    const assignedPanels = customerAccounts[currentCustomer].panels || [];
+
+    assignedPanels.forEach(panelId => {
+      const btn = document.createElement('div');
+      btn.className = 'panel-card-btn';
+      btn.onclick = () => selectPanel(panelId);
+      btn.innerHTML = `
+        <i class="fa-solid fa-microchip"></i>
+        <span class="panel-card-name">${panelId}</span>
+        <span class="panel-card-status"><i class="fa-solid fa-circle-check"></i> Select Panel</span>
+      `;
+      panelSelectList.appendChild(btn);
+    });
+  }
+
+  showView('panelSelectView');
 }
 
-/* ==========================================================================
-   LIVE MONITORING - FastAPI Data Fetching (Database -> FastAPI -> Dashboard)
-   Do NOT modify this section's behavior.
-   ========================================================================== */
+function selectPanel(panelId) {
+  if (!currentCustomer || !customerAccounts[currentCustomer]) {
+    showLoginScreen();
+    return;
+  }
+
+  const assignedPanels = customerAccounts[currentCustomer].panels || [];
+  if (!assignedPanels.includes(panelId)) {
+    alert(`Access Denied: ${panelId} is not assigned to customer ${currentCustomer}`);
+    return;
+  }
+
+  selectedPanelId = panelId;
+  localStorage.setItem('mv_panel_id', panelId);
+
+  // Update Header UI
+  const headerCustomer = document.getElementById('headerCustomer');
+  const headerPanel = document.getElementById('headerPanel');
+  const histPanelBadge = document.getElementById('histPanelFilterBadge');
+
+  if (headerCustomer) headerCustomer.textContent = currentCustomer;
+  if (headerPanel) headerPanel.textContent = selectedPanelId;
+  if (histPanelBadge) histPanelBadge.textContent = selectedPanelId;
+
+  // Clear previous metrics & chart buffer
+  chartHistoryData = [];
+  clearDashboardMetrics();
+  initTelemetryChart();
+
+  showView('dashboardView');
+  startLivePolling();
+}
+
+function changePanel() {
+  stopLivePolling();
+  showPanelSelection();
+}
+
+function logoutCustomer() {
+  stopLivePolling();
+  currentCustomer = null;
+  selectedPanelId = null;
+  localStorage.removeItem('mv_customer_id');
+  localStorage.removeItem('mv_panel_id');
+  showLoginScreen();
+}
+
+// --------------------------------------------------------------------------
+// 3. LIVE POLLING & API REQUEST HANDLING
+// --------------------------------------------------------------------------
+
 function startLivePolling() {
-  setConnectionState('offline', 'Connecting to FastAPI...');
+  stopLivePolling();
+  if (!selectedPanelId) return;
 
-  // Fetch immediately, then poll on an interval
   fetchLatestData();
+  livePollingInterval = setInterval(fetchLatestData, 2000);
+}
 
-  if (pollIntervalHandle) clearInterval(pollIntervalHandle);
-  pollIntervalHandle = setInterval(fetchLatestData, POLL_INTERVAL_MS);
+function stopLivePolling() {
+  if (livePollingInterval) {
+    clearInterval(livePollingInterval);
+    livePollingInterval = null;
+  }
 }
 
 async function fetchLatestData() {
+  if (!selectedPanelId) return;
+
+  const url = `${LATEST_ENDPOINT}?panel_id=${encodeURIComponent(selectedPanelId)}`;
+
   try {
-    const response = await fetch(LATEST_ENDPOINT);
+    const response = await fetch(url);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      updateConnectionStatus(false, "Offline");
+      showNoDataAlert(selectedPanelId);
+      clearDashboardMetrics();
+      return;
     }
 
     const data = await response.json();
 
-    setConnectionState('online', 'Connected (FastAPI)');
+    // Verify if response contains valid telemetry object
+    if (!data || Object.keys(data).length === 0 || data.detail) {
+      updateConnectionStatus(true, "Online (No Data)");
+      showNoDataAlert(selectedPanelId);
+      clearDashboardMetrics();
+      return;
+    }
+
+    // Valid data received
+    hideNoDataAlert();
+    updateConnectionStatus(true, "Online");
     processTelemetryData(data);
 
-  } catch (err) {
-    console.error('Error fetching latest telemetry from FastAPI:', err);
-    setConnectionState('offline', 'FastAPI Disconnected');
+  } catch (error) {
+    console.error("API Polling Error:", error);
+    updateConnectionStatus(false, "Disconnected");
+    showNoDataAlert(selectedPanelId);
+    clearDashboardMetrics();
   }
 }
 
-/* ==========================================================================
-   Telemetry Processing & UI Updates (Live Monitoring - unchanged)
+function updateConnectionStatus(isOnline, textStatus) {
+  const statusContainer = document.getElementById('connectionStatus');
+  const statusText = document.getElementById('statusText');
+  if (!statusContainer || !statusText) return;
 
-   NOTE ON RELAY CURRENTS: relay.i1/i2/i3/i0 arrive from the backend
-   (/latest) as the GENUINE LIVE relay readings, always - the backend never
-   substitutes them with the fault record's "At Trip" snapshot, even while
-   an Overcurrent or Earth fault is active. This section displays them
-   as-is; it never needs to choose between live and At-Trip values itself.
-   ========================================================================== */
+  statusText.textContent = textStatus || (isOnline ? "Online" : "Disconnected");
+
+  const dot = statusContainer.querySelector('.status-dot');
+  if (dot) {
+    dot.className = 'status-dot ' + (isOnline ? 'online' : 'offline');
+  }
+}
+
+// --------------------------------------------------------------------------
+// 4. NO DATA HANDLING & DASHBOARD CLEARING
+// --------------------------------------------------------------------------
+
+function showNoDataAlert(panelId) {
+  const alertContainer = document.getElementById('alertContainer');
+  if (!alertContainer) return;
+
+  // Avoid duplicate no-data alert
+  let alertBanner = document.getElementById('noDataAlertBanner');
+  if (!alertBanner) {
+    alertBanner = document.createElement('div');
+    alertBanner.id = 'noDataAlertBanner';
+    alertBanner.className = 'alert-banner no-data-alert';
+    alertContainer.appendChild(alertBanner);
+  }
+  alertBanner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> No data available for ${panelId}`;
+  alertBanner.classList.remove('hidden');
+}
+
+function hideNoDataAlert() {
+  const alertBanner = document.getElementById('noDataAlertBanner');
+  if (alertBanner) {
+    alertBanner.classList.add('hidden');
+  }
+}
+
+function clearDashboardMetrics() {
+  const setText = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+
+  // Timestamp
+  setText('lastUpdated', '--:--:--');
+
+  // Summary Metrics
+  setText('sumFreq', '--');
+  setText('sumPower', '--');
+  setText('sumPF', '--');
+  setText('sumAvgV', '--');
+  setText('sumTemp', '--');
+  setText('sumHum', '--');
+
+  // Relay Section
+  setText('relaySG', 'SG1');
+  setText('relayIPhasePickup', '-- A');
+  setText('relayIEarthPickup', '-- A');
+  setText('relayOpCounter', '--');
+  setText('relayI1', '--');
+  setText('relayI2', '--');
+  setText('relayI3', '--');
+  setText('relayI0', '--');
+  setText('relayNegSeq', '-- A');
+  setText('relayThermal', '-- %');
+
+  const thermalBar = document.getElementById('thermalBar');
+  if (thermalBar) thermalBar.style.width = '0%';
+
+  setText('pillI1', 'Normal');
+  setText('pillI2', 'Normal');
+  setText('pillI3', 'Normal');
+  setText('pillI0', 'Normal');
+
+  // Fault Banner Reset
+  const faultBanner = document.getElementById('faultSummaryBanner');
+  const faultIcon = document.getElementById('faultIcon');
+  const faultText = document.getElementById('faultSummaryText');
+  if (faultBanner) faultBanner.className = 'fault-summary-banner healthy';
+  if (faultIcon) faultIcon.className = 'fa-solid fa-circle-check';
+  if (faultText) faultText.textContent = 'No Fault Detected';
+
+  // Event Log
+  setText('eventType', '--');
+  setText('eventSubtype', '--');
+  setText('eventTime', '--/--/-- --:--:--');
+  setText('relayRtc', '--/--/20-- --:--:--');
+
+  // EMS-01 Meter Section
+  setText('meterVR', '-- V');
+  setText('meterVY', '-- V');
+  setText('meterVB', '-- V');
+  setText('meterIR', '--');
+  setText('meterIY', '--');
+  setText('meterIB', '--');
+  setText('meterPFR', '--');
+  setText('meterPFY', '--');
+  setText('meterPFB', '--');
+  setText('meterPR', '--');
+  setText('meterPY', '--');
+  setText('meterPB', '--');
+  setText('meterPFT', '--');
+  setText('meterPT', '-- kW');
+  setText('meterFreq', '-- Hz');
+
+  // DHT22 Environmental Section
+  setText('dhtTemp', '--');
+  setText('dhtHum', '--');
+
+  const tempBadge = document.getElementById('tempAlertBadge');
+  const humBadge = document.getElementById('humAlertBadge');
+  if (tempBadge) tempBadge.classList.add('hidden');
+  if (humBadge) humBadge.classList.add('hidden');
+
+  // Fault Record
+  setText('frStageStart', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
+  setText('frStageTrip', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
+  setText('frStagePost80', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
+  setText('frStagePost200', 'I1: -- A | I2: -- A | I3: -- A | I0: -- A');
+}
+
+// --------------------------------------------------------------------------
+// 5. TELEMETRY DATA PROCESSING & UI BINDING
+// --------------------------------------------------------------------------
+
 function processTelemetryData(data) {
-  updateTimestamp();
+  if (!data) return;
+
+  const setText = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = (val !== undefined && val !== null) ? val : '--';
+  };
+
+  const hasVal = (v) => (v !== undefined && v !== null);
+
+  // Browser receipt timestamp
+  const nowStr = new Date().toLocaleTimeString();
+  setText('lastUpdated', nowStr);
 
   const relay = data.relay || {};
   const meter = data.meter || {};
   const dht = data.dht || {};
 
-  // Cache in Local IndexedDB (temporary browser cache only)
-  saveTelemetryToDB(data);
+  // 1. RELAY PROTECTION (ABB REJ601)
+  const sgActive = relay.sg_active;
+  setText('relaySG', hasVal(sgActive) ? `SG${sgActive}` : 'SG1');
 
-  // 1. RELAY SECTION
-  if (relay.sg_active !== undefined) document.getElementById('relaySG').innerText = `SG${relay.sg_active}`;
-  if (relay.pickup_phase !== undefined) document.getElementById('relayIPhasePickup').innerText = `${Number(relay.pickup_phase).toFixed(2)} A`;
-  if (relay.pickup_earth !== undefined) document.getElementById('relayIEarthPickup').innerText = `${Number(relay.pickup_earth).toFixed(2)} A`;
-  if (relay.op_counter !== undefined) document.getElementById('relayOpCounter').innerText = relay.op_counter;
+  const phasePickup = hasVal(relay.pickup_phase) ? Number(relay.pickup_phase) : 1;
+  const earthPickup = hasVal(relay.pickup_earth) ? Number(relay.pickup_earth) : 15;
 
-  const i1 = relay.i1;
-  const i2 = relay.i2;
-  const i3 = relay.i3;
-  const i0 = relay.i0;
-  const pickupIphase = isInvalid(relay.pickup_phase) ? 30.0 : Number(relay.pickup_phase);
-  const pickupIearth = isInvalid(relay.pickup_earth) ? 15.0 : Number(relay.pickup_earth);
+  setText('relayIPhasePickup', hasVal(relay.pickup_phase) ? `${relay.pickup_phase} A` : '-- A');
+  setText('relayIEarthPickup', hasVal(relay.pickup_earth) ? `${relay.pickup_earth} A` : '-- A');
+  setText('relayOpCounter', hasVal(relay.op_counter) ? relay.op_counter : '--');
 
-  document.getElementById('relayI1').innerText = isInvalid(i1) ? '--' : Number(i1).toFixed(2);
-  document.getElementById('relayI2').innerText = isInvalid(i2) ? '--' : Number(i2).toFixed(2);
-  document.getElementById('relayI3').innerText = isInvalid(i3) ? '--' : Number(i3).toFixed(2);
-  document.getElementById('relayI0').innerText = isInvalid(i0) ? '--' : Number(i0).toFixed(2);
+  const i1 = hasVal(relay.i1) ? Number(relay.i1) : 0;
+  const i2 = hasVal(relay.i2) ? Number(relay.i2) : 0;
+  const i3 = hasVal(relay.i3) ? Number(relay.i3) : 0;
+  const i0 = hasVal(relay.i0) ? Number(relay.i0) : 0;
 
-  // Evaluate Phase Overcurrent & Earth Fault alarms
-  updatePhaseAlarm('pillI1', i1, pickupIphase);
-  updatePhaseAlarm('pillI2', i2, pickupIphase);
-  updatePhaseAlarm('pillI3', i3, pickupIphase);
-  updatePhaseAlarm('pillI0', i0, pickupIearth);
+  setText('relayI1', hasVal(relay.i1) ? i1.toFixed(2) : '--');
+  setText('relayI2', hasVal(relay.i2) ? i2.toFixed(2) : '--');
+  setText('relayI3', hasVal(relay.i3) ? i3.toFixed(2) : '--');
+  setText('relayI0', hasVal(relay.i0) ? i0.toFixed(2) : '--');
 
-  /* ------------------------------------------------------------------
-     LIVE FAULT STATUS
-     ------------------------------------------------------------------
-     The banner/icon/text are fully re-derived from scratch on every
-     single polling cycle using ONLY `relay.live_fault_status` from the
-     latest record returned by /latest (already a canonical string from
-     the backend's derive_fault_status(): "No Fault Detected" /
-     "Fault Detected - O/C (Overcurrent Phase-to-Phase)" /
-     "Fault Detected - E/F (Single Line Earth Fault Current)"). Nothing
-     here is additive/sticky:
-     - `text.innerText` is reassigned every call (not appended to).
-     - `banner.className` is reassigned every call (not toggled), so a
-       "faulted" class from a previous cycle can never linger once the
-       new record reports healthy.
-     This guarantees a fault clears immediately the moment the next
-     polled record shows no fault, and a new fault is shown immediately
-     the moment the next polled record reports one.
+  const negSeq = hasVal(relay.neg_seq) ? Number(relay.neg_seq) : 0;
+  const thermalLevel = hasVal(relay.thermal_level) ? Number(relay.thermal_level) : 0;
 
-     isActiveFault() checks the PREFIX of the string, not a bare
-     substring match - "No Fault Detected" must never be classified as
-     an active fault.
-     ------------------------------------------------------------------ */
-  const latestFaultValue = (relay.live_fault_status && String(relay.live_fault_status).trim())
-    ? String(relay.live_fault_status).trim()
-    : "No Fault Detected";
+  setText('relayNegSeq', hasVal(relay.neg_seq) ? `${negSeq.toFixed(2)} A` : '-- A');
+  setText('relayThermal', hasVal(relay.thermal_level) ? `${thermalLevel.toFixed(1)} %` : '-- %');
 
-  const banner = document.getElementById('faultSummaryBanner');
-  const icon = document.getElementById('faultIcon');
-  const text = document.getElementById('faultSummaryText');
+  const thermalBar = document.getElementById('thermalBar');
+  if (thermalBar) thermalBar.style.width = `${Math.min(thermalLevel, 100)}%`;
 
-  // Always overwrite (never merge/append) with this cycle's value only.
-  text.innerText = latestFaultValue;
+  // Fault Alarm Pills
+  updatePill('pillI1', hasVal(relay.i1) && i1 > phasePickup);
+  updatePill('pillI2', hasVal(relay.i2) && i2 > phasePickup);
+  updatePill('pillI3', hasVal(relay.i3) && i3 > phasePickup);
+  updatePill('pillI0', hasVal(relay.i0) && i0 > earthPickup);
 
-  if (isActiveFault(latestFaultValue)) {
-    banner.className = 'fault-summary-banner faulted';
-    icon.className = 'fa-solid fa-triangle-exclamation';
-  } else {
-    banner.className = 'fault-summary-banner healthy';
-    icon.className = 'fa-solid fa-circle-check';
+  // Live Fault Status Banner (from data.relay.live_fault_status)
+  const liveFaultStatus = relay.live_fault_status || "No Fault Detected";
+  const faultBanner = document.getElementById('faultSummaryBanner');
+  const faultIcon = document.getElementById('faultIcon');
+  const faultText = document.getElementById('faultSummaryText');
+
+  if (faultText) faultText.textContent = liveFaultStatus;
+  const isFaulted = liveFaultStatus !== "No Fault Detected" && !liveFaultStatus.toLowerCase().includes("normal");
+
+  if (faultBanner) {
+    faultBanner.className = 'fault-summary-banner ' + (isFaulted ? 'faulted' : 'healthy');
+  }
+  if (faultIcon) {
+    faultIcon.className = isFaulted ? 'fa-solid fa-triangle-exclamation' : 'fa-solid fa-circle-check';
   }
 
-  document.getElementById('relayNegSeq').innerText = isInvalid(relay.neg_seq) ? '-- A' : `${Number(relay.neg_seq).toFixed(2)} A`;
-  if (!isInvalid(relay.thermal_level)) {
-    document.getElementById('relayThermal').innerText = `${relay.thermal_level}%`;
-    document.getElementById('thermalBar').style.width = `${Math.min(relay.thermal_level, 100)}%`;
-  }
-  if (relay.rtc) document.getElementById('relayRtc').innerText = relay.rtc;
+  // Event log & RTC
+  const evt = relay.event || {};
+  setText('eventType', hasVal(evt.type) ? evt.type : '--');
+  setText('eventSubtype', hasVal(evt.subtype) ? evt.subtype : '--');
+  setText('eventTime', evt.timestamp || '--/--/-- --:--:--');
+  setText('relayRtc', relay.rtc || '--/--/20-- --:--:--');
 
-  // Latest Event
-  if (relay.event) {
-    document.getElementById('eventType').innerText = relay.event.type ?? '--';
-    document.getElementById('eventSubtype').innerText = relay.event.subtype ?? '--';
-    document.getElementById('eventTime').innerText = relay.event.timestamp ?? '--';
+  // 2. EMS-01 POWER QUALITY METER
+  const vR = hasVal(meter.v_r) ? Number(meter.v_r) : 0;
+  const vY = hasVal(meter.v_y) ? Number(meter.v_y) : 0;
+  const vB = hasVal(meter.v_b) ? Number(meter.v_b) : 0;
+
+  const iR = hasVal(meter.i_r) ? Number(meter.i_r) : 0;
+  const iY = hasVal(meter.i_y) ? Number(meter.i_y) : 0;
+  const iB = hasVal(meter.i_b) ? Number(meter.i_b) : 0;
+
+  const pfR = hasVal(meter.pf_r) ? Number(meter.pf_r) : 1.0;
+  const pfY = hasVal(meter.pf_y) ? Number(meter.pf_y) : 1.0;
+  const pfB = hasVal(meter.pf_b) ? Number(meter.pf_b) : 1.0;
+  const pfT = hasVal(meter.pf_t) ? Number(meter.pf_t) : 1.0;
+
+  const pR = hasVal(meter.p_r) ? Number(meter.p_r) : 0;
+  const pY = hasVal(meter.p_y) ? Number(meter.p_y) : 0;
+  const pB = hasVal(meter.p_b) ? Number(meter.p_b) : 0;
+  const pT = hasVal(meter.p_t) ? Number(meter.p_t) : 0;
+
+  const freq = hasVal(meter.frequency) ? Number(meter.frequency) : 50.0;
+
+  setText('meterVR', hasVal(meter.v_r) ? `${vR.toFixed(1)} V` : '-- V');
+  setText('meterVY', hasVal(meter.v_y) ? `${vY.toFixed(1)} V` : '-- V');
+  setText('meterVB', hasVal(meter.v_b) ? `${vB.toFixed(1)} V` : '-- V');
+
+  setText('meterIR', hasVal(meter.i_r) ? iR.toFixed(2) : '--');
+  setText('meterIY', hasVal(meter.i_y) ? iY.toFixed(2) : '--');
+  setText('meterIB', hasVal(meter.i_b) ? iB.toFixed(2) : '--');
+
+  setText('meterPFR', hasVal(meter.pf_r) ? pfR.toFixed(2) : '--');
+  setText('meterPFY', hasVal(meter.pf_y) ? pfY.toFixed(2) : '--');
+  setText('meterPFB', hasVal(meter.pf_b) ? pfB.toFixed(2) : '--');
+
+  setText('meterPR', hasVal(meter.p_r) ? pR.toFixed(2) : '--');
+  setText('meterPY', hasVal(meter.p_y) ? pY.toFixed(2) : '--');
+  setText('meterPB', hasVal(meter.p_b) ? pB.toFixed(2) : '--');
+
+  setText('meterPFT', hasVal(meter.pf_t) ? pfT.toFixed(2) : '--');
+  setText('meterPT', hasVal(meter.p_t) ? `${pT.toFixed(2)} kW` : '-- kW');
+  setText('meterFreq', hasVal(meter.frequency) ? `${freq.toFixed(2)} Hz` : '-- Hz');
+
+  // 3. SYSTEM TELEMETRY SUMMARY CARDS
+  const avgV = (hasVal(meter.v_r) && hasVal(meter.v_y) && hasVal(meter.v_b))
+    ? (vR + vY + vB) / 3
+    : null;
+
+  setText('sumFreq', hasVal(meter.frequency) ? freq.toFixed(2) : '--');
+  setText('sumPower', hasVal(meter.p_t) ? pT.toFixed(2) : '--');
+  setText('sumPF', hasVal(meter.pf_t) ? pfT.toFixed(2) : '--');
+  setText('sumAvgV', avgV !== null ? avgV.toFixed(1) : '--');
+
+  // 4. DHT22 ENVIRONMENTAL DATA
+  const temp = hasVal(dht.temperature) ? Number(dht.temperature) : 0;
+  const hum = hasVal(dht.humidity) ? Number(dht.humidity) : 0;
+
+  setText('dhtTemp', hasVal(dht.temperature) ? temp.toFixed(1) : '--');
+  setText('dhtHum', hasVal(dht.humidity) ? hum.toFixed(1) : '--');
+
+  setText('sumTemp', hasVal(dht.temperature) ? temp.toFixed(1) : '--');
+  setText('sumHum', hasVal(dht.humidity) ? hum.toFixed(1) : '--');
+
+  const tempBadge = document.getElementById('tempAlertBadge');
+  const humBadge = document.getElementById('humAlertBadge');
+
+  if (tempBadge) {
+    if (hasVal(dht.temperature) && temp > 50.0) tempBadge.classList.remove('hidden');
+    else tempBadge.classList.add('hidden');
+  }
+  if (humBadge) {
+    if (hasVal(dht.humidity) && hum > 80.0) humBadge.classList.remove('hidden');
+    else humBadge.classList.add('hidden');
   }
 
-  // Fault Record 1 (historical trip)
-  if (relay.fault_record1) {
-    const fr = relay.fault_record1;
-    if (fr.pre_start) document.getElementById('recPreStart').innerText = fr.pre_start;
-    if (fr.at_start) document.getElementById('recAtStart').innerText = fr.at_start;
-    if (fr.at_start_time) document.getElementById('recAtStartTime').innerText = `@ ${fr.at_start_time}`;
-    if (fr.at_trip) document.getElementById('recAtTrip').innerText = fr.at_trip;
-    if (fr.at_trip_time) document.getElementById('recAtTripTime').innerText = `@ ${fr.at_trip_time}`;
-    if (fr.p80) document.getElementById('recP80').innerText = fr.p80;
-    if (fr.p200) document.getElementById('recP200').innerText = fr.p200;
-    if (fr.at_trip_status) {
-      document.getElementById('recAtTripStatus').innerText = `Last trip classification: ${fr.at_trip_status}`;
+  // 5. HISTORICAL FAULT RECORD TIMELINE (data.relay.fault_record1)
+  const fr = relay.fault_record1 || relay.fault_record_1;
+  if (fr) {
+    if (fr.at_start_time) setText('frStageStart_time', fr.at_start_time);
+    if (fr.at_start) {
+      setText('frStageStart', fr.at_start);
+    } else if (fr.pre_start) {
+      setText('frStageStart', fr.pre_start);
     }
+
+    if (fr.at_trip_time) setText('frStageTrip_time', fr.at_trip_time);
+    if (fr.at_trip) setText('frStageTrip', fr.at_trip);
   }
 
-  // 2. METER SECTION
-  document.getElementById('meterVR').innerHTML = formatVal(meter.v_r, 'V');
-  document.getElementById('meterVY').innerHTML = formatVal(meter.v_y, 'V');
-  document.getElementById('meterVB').innerHTML = formatVal(meter.v_b, 'V');
-
-  document.getElementById('meterIR').innerHTML = formatVal(meter.i_r, 'A');
-  document.getElementById('meterIY').innerHTML = formatVal(meter.i_y, 'A');
-  document.getElementById('meterIB').innerHTML = formatVal(meter.i_b, 'A');
-
-  document.getElementById('meterPFR').innerText = formatValRaw(meter.pf_r);
-  document.getElementById('meterPFY').innerText = formatValRaw(meter.pf_y);
-  document.getElementById('meterPFB').innerText = formatValRaw(meter.pf_b);
-  document.getElementById('meterPFT').innerText = formatValRaw(meter.pf_t);
-
-  document.getElementById('meterPR').innerText = formatValRaw(meter.p_r) + ' kW';
-  document.getElementById('meterPY').innerText = formatValRaw(meter.p_y) + ' kW';
-  document.getElementById('meterPB').innerText = formatValRaw(meter.p_b) + ' kW';
-  document.getElementById('meterPT').innerText = formatValRaw(meter.p_t) + ' kW';
-
-  document.getElementById('meterFreq').innerText = isInvalid(meter.frequency) ? '-- Hz' : `${Number(meter.frequency).toFixed(2)} Hz`;
-
-  // 3. DHT22 SENSOR SECTION
-  const temp = dht.temperature;
-  const hum = dht.humidity;
-
-  document.getElementById('dhtTemp').innerText = isInvalid(temp) ? '--' : Number(temp).toFixed(1);
-  document.getElementById('dhtHum').innerText = isInvalid(hum) ? '--' : Number(hum).toFixed(1);
-
-  // Check temperature & humidity alerts (>40°C, >80%)
-  const tempAlert = document.getElementById('tempAlert');
-  const humAlert = document.getElementById('humAlert');
-
-  if (!isInvalid(temp) && Number(temp) > 40.0) {
-    tempAlert.classList.remove('hidden');
-    triggerAlertBanner('high-temp-banner', '⚠ HIGH TEMPERATURE ALERT! Panel Temp > 40.0 °C', 'high-temp');
-  } else {
-    tempAlert.classList.add('hidden');
-    removeAlertBanner('high-temp-banner');
-  }
-
-  if (!isInvalid(hum) && Number(hum) > 80.0) {
-    humAlert.classList.remove('hidden');
-    triggerAlertBanner('high-hum-banner', '⚠ HIGH HUMIDITY ALERT! Panel Humidity > 80.0 %', 'high-hum');
-  } else {
-    humAlert.classList.add('hidden');
-    removeAlertBanner('high-hum-banner');
-  }
-
-  // 4. SUMMARY METRICS HEADER
-  document.getElementById('sumFreq').innerText = isInvalid(meter.frequency) ? '--' : Number(meter.frequency).toFixed(2);
-  document.getElementById('sumPower').innerText = formatValRaw(meter.p_t);
-  document.getElementById('sumPF').innerText = formatValRaw(meter.pf_t);
-
-  let avgV = '--';
-  if (!isInvalid(meter.v_r) && !isInvalid(meter.v_y) && !isInvalid(meter.v_b)) {
-    avgV = ((Number(meter.v_r) + Number(meter.v_y) + Number(meter.v_b)) / 3.0).toFixed(1);
-  }
-  document.getElementById('sumAvgV').innerText = avgV;
-
-  document.getElementById('sumTemp').innerText = isInvalid(temp) ? '--' : Number(temp).toFixed(1);
-  document.getElementById('sumHum').innerText = isInvalid(hum) ? '--' : Number(hum).toFixed(1);
-
-  // 5. UPDATE LIVE CHART TELEMETRY BUFFER (only if live chart is active)
-  if (!isShowingHistorical) {
-    pushChartBuffer(i1, i2, i3, i0, meter.v_r, meter.v_y, meter.v_b, temp, hum);
-  }
+  // 6. UPDATE LIVE TELEMETRY TREND CHARTS
+  pushChartPoint(nowStr, { i1, i2, i3, vR, vY, vB, temp, hum });
 }
 
-// Helpers
-function formatVal(val, unit) {
-  if (isInvalid(val)) return `-- <span class="u">${unit}</span>`;
-  return `${Number(val).toFixed(1)} <span class="u">${unit}</span>`;
-}
-function formatValRaw(val) {
-  if (isInvalid(val)) return '--';
-  return Number(val).toFixed(2);
-}
-
-function updatePhaseAlarm(elemId, val, threshold) {
-  const pill = document.getElementById(elemId);
+function updatePill(pillId, isAlarm) {
+  const pill = document.getElementById(pillId);
   if (!pill) return;
-  if (!isInvalid(val) && Number(val) > threshold) {
-    pill.innerText = 'ALARM';
-    pill.className = 'fault-status-pill alarm';
+
+  if (isAlarm) {
+    pill.textContent = "ALARM";
+    pill.className = "fault-status-pill alarm";
   } else {
-    pill.innerText = 'Normal';
-    pill.className = 'fault-status-pill';
+    pill.textContent = "NORMAL";
+    pill.className = "fault-status-pill";
   }
 }
 
-/* Alert Banner Display */
-function triggerAlertBanner(id, text, alertClass) {
-  let banner = document.getElementById(id);
-  const container = document.getElementById('alertContainer');
-  if (!banner) {
-    banner = document.createElement('div');
-    banner.id = id;
-    banner.className = `alert-banner ${alertClass}`;
-    banner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span>${text}</span>`;
-    container.appendChild(banner);
+// --------------------------------------------------------------------------
+// 6. REAL-TIME TELEMETRY CHARTS (CHART.JS)
+// --------------------------------------------------------------------------
+
+function initTelemetryChart() {
+  const ctx = document.getElementById('telemetryChart');
+  if (!ctx) return;
+
+  if (telemetryChartInstance) {
+    telemetryChartInstance.destroy();
   }
-}
 
-function removeAlertBanner(id) {
-  const banner = document.getElementById(id);
-  if (banner) banner.remove();
-}
-
-/* ==========================================================================
-   Chart.js Real-time / Historical Trend Graph (shared canvas)
-   ========================================================================== */
-function initChart() {
-  const ctx = document.getElementById('telemetryChart').getContext('2d');
-
-  chartInstance = new Chart(ctx, {
+  telemetryChartInstance = new Chart(ctx, {
     type: 'line',
     data: {
       labels: [],
-      datasets: []
+      datasets: [
+        { label: 'I1 (Phase 1)', data: [], borderColor: '#f43f5e', tension: 0.3, fill: false },
+        { label: 'I2 (Phase 2)', data: [], borderColor: '#eab308', tension: 0.3, fill: false },
+        { label: 'I3 (Phase 3)', data: [], borderColor: '#3b82f6', tension: 0.3, fill: false }
+      ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: { duration: 300 },
       scales: {
-        x: {
-          grid: { color: 'rgba(255, 255, 255, 0.05)' },
-          ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 } }
-        },
-        y: {
-          grid: { color: 'rgba(255, 255, 255, 0.08)' },
-          ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 11 } }
-        }
+        x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255, 255, 255, 0.05)' } },
+        y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(255, 255, 255, 0.05)' } }
       },
       plugins: {
-        legend: {
-          labels: { color: '#f1f5f9', font: { family: 'Plus Jakarta Sans', weight: '600' } }
-        }
+        legend: { labels: { color: '#f1f5f9' } }
       }
     }
   });
-
-  updateChartDatasets();
 }
 
-function switchChartMode(mode) {
-  activeChartMode = mode;
-  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
-  event.target.classList.add('active');
-
-  if (isShowingHistorical) {
-    updateHistoricalChart(currentHistoricalRecords);
-  } else {
-    updateChartDatasets();
+function pushChartPoint(timestamp, metrics) {
+  chartHistoryData.push({ timestamp, ...metrics });
+  if (chartHistoryData.length > 20) {
+    chartHistoryData.shift();
   }
+  renderChartData();
 }
 
-function updateChartDatasets() {
-  if (!chartInstance) return;
-
-  if (activeChartMode === 'currents') {
-    chartInstance.data.datasets = [
-      { label: 'Relay I1 (A)', data: chartDataBuffer.i1, borderColor: '#f43f5e', backgroundColor: 'rgba(244, 63, 94, 0.1)', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I2 (A)', data: chartDataBuffer.i2, borderColor: '#eab308', backgroundColor: 'rgba(234, 179, 8, 0.1)', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I3 (A)', data: chartDataBuffer.i3, borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I0 Earth (A)', data: chartDataBuffer.i0, borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.1)', tension: 0.3, borderWidth: 2, borderDash: [4, 4] }
-    ];
-  } else if (activeChartMode === 'voltages') {
-    chartInstance.data.datasets = [
-      { label: 'Meter V_R (V)', data: chartDataBuffer.vr, borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_Y (V)', data: chartDataBuffer.vy, borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_B (V)', data: chartDataBuffer.vb, borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 }
-    ];
-  } else if (activeChartMode === 'environment') {
-    chartInstance.data.datasets = [
-      { label: 'Temp (°C)', data: chartDataBuffer.temp, borderColor: '#f97316', backgroundColor: 'rgba(249, 115, 22, 0.1)', tension: 0.3, borderWidth: 2 },
-      { label: 'Humidity (%)', data: chartDataBuffer.hum, borderColor: '#06b6d4', backgroundColor: 'rgba(6, 182, 212, 0.1)', tension: 0.3, borderWidth: 2 }
-    ];
-  }
-
-  chartInstance.update();
-}
-
-function pushChartBuffer(i1, i2, i3, i0, vr, vy, vb, temp, hum) {
-  const maxSamples = 20;
-  const timeLabel = new Date().toLocaleTimeString();
-
-  chartDataBuffer.timestamps.push(timeLabel);
-  chartDataBuffer.i1.push(isInvalid(i1) ? null : Number(i1));
-  chartDataBuffer.i2.push(isInvalid(i2) ? null : Number(i2));
-  chartDataBuffer.i3.push(isInvalid(i3) ? null : Number(i3));
-  chartDataBuffer.i0.push(isInvalid(i0) ? null : Number(i0));
-
-  chartDataBuffer.vr.push(isInvalid(vr) ? null : Number(vr));
-  chartDataBuffer.vy.push(isInvalid(vy) ? null : Number(vy));
-  chartDataBuffer.vb.push(isInvalid(vb) ? null : Number(vb));
-
-  chartDataBuffer.temp.push(isInvalid(temp) ? null : Number(temp));
-  chartDataBuffer.hum.push(isInvalid(hum) ? null : Number(hum));
-
-  if (chartDataBuffer.timestamps.length > maxSamples) {
-    chartDataBuffer.timestamps.shift();
-    chartDataBuffer.i1.shift();
-    chartDataBuffer.i2.shift();
-    chartDataBuffer.i3.shift();
-    chartDataBuffer.i0.shift();
-    chartDataBuffer.vr.shift();
-    chartDataBuffer.vy.shift();
-    chartDataBuffer.vb.shift();
-    chartDataBuffer.temp.shift();
-    chartDataBuffer.hum.shift();
-  }
-
-  if (chartInstance) {
-    chartInstance.data.labels = chartDataBuffer.timestamps;
-    chartInstance.update('none');
-  }
-}
-
-/* ==========================================================================
-   HISTORICAL DATA MODULE
-   Source of truth: PostgreSQL, accessed exclusively through FastAPI
-   GET  /history  -> search/filter records
-   DELETE /history -> remove records matching the selected filters
-
-   NOTE ON RELAY CURRENTS: every read of relay current in this module goes
-   through resolveRelayCurrents(record) (defined near the top of this file)
-   instead of reading r.relay_i1/i2/i3/i0 directly. That guarantees the
-   table, the chart, both bulk/single-record exports, and the View
-   Details -> "Relay Currents" section can never disagree with each
-   other. This resolver is never used for the Live Dashboard, which
-   always shows the genuine live relay_i1..i0 reading regardless of
-   fault state.
-   ========================================================================== */
-
-// Small numeric helpers used by table rendering, chart plotting and export
-function numOrNull(v) {
-  return isInvalid(v) ? null : Number(v);
-}
-
-// Formats a raw numeric DB value to a fixed number of decimals, or '--'
-// if it is missing/invalid. Used by the Historical Records table so it
-// always shows the EXACT stored value (never an average) - CHANGE 2.
-function fmtNum(val, decimals = 2) {
-  return isInvalid(val) ? '--' : Number(val).toFixed(decimals);
-}
-
-function showHistoryMessage(msg) {
-  const msgEl = document.getElementById('historyMessage');
-  const tableWrapper = document.getElementById('historyTableWrapper');
-  if (msgEl) {
-    msgEl.innerText = msg;
-    msgEl.classList.remove('hidden');
-  }
-  if (tableWrapper) tableWrapper.classList.add('hidden');
-}
-
-function hideHistoryMessage() {
-  const msgEl = document.getElementById('historyMessage');
-  const tableWrapper = document.getElementById('historyTableWrapper');
-  if (msgEl) msgEl.classList.add('hidden');
-  if (tableWrapper) tableWrapper.classList.remove('hidden');
-}
-
-// Reads the current filter inputs (Start Date, End Date, Panel ID)
-function getHistoryFilters() {
-  const startDate = document.getElementById('histStart').value;
-  const endDate = document.getElementById('histEnd').value;
-  const panelId = document.getElementById('histPanelId').value.trim();
-  return { startDate, endDate, panelId };
-}
-
-// Best-effort JSON parse of a fetch Response body. Returns null if the body
-// isn't valid JSON (e.g. an empty body) instead of throwing.
-async function safeReadJson(response) {
-  try {
-    return await response.json();
-  } catch (_e) {
-    return null;
-  }
-}
-
-// GET /history?start_date=...&end_date=...&panel_id=...
-async function fetchHistoricalData() {
-  const { startDate, endDate, panelId } = getHistoryFilters();
-
-  if (!startDate) {
-    alert('Please select a Start Date.');
-    return;
-  }
-  if (!endDate) {
-    alert('Please select an End Date.');
-    return;
-  }
-
-  if (new Date(startDate) > new Date(endDate)) {
-    alert('Start date/time cannot be after End date/time.');
-    return;
-  }
-
-  const params = new URLSearchParams();
-  params.set('start_date', startDate);
-  params.set('end_date', endDate);
-  if (panelId) params.set('panel_id', panelId);
-
-  showHistoryMessage('Loading historical records...');
-
-  try {
-    const response = await fetch(`${HISTORY_ENDPOINT}?${params.toString()}`);
-    const payload = await safeReadJson(response);
-
-    if (!response.ok) {
-      // Surface the backend's actual validation/error message (e.g. a bad
-      // date format) instead of a generic "unable to load" string.
-      const detail = (payload && payload.detail) ? payload.detail : `Request failed (HTTP ${response.status}).`;
-      throw new Error(detail);
+function switchChartTab(tabName) {
+  activeChartTab = tabName;
+  const tabs = ['telemetry', 'voltages', 'climate'];
+  tabs.forEach(t => {
+    const btn = document.getElementById(`chartTab${t.charAt(0).toUpperCase() + t.slice(1)}`);
+    if (btn) {
+      if (t === tabName || (t === 'telemetry' && tabName === 'telemetry')) {
+        btn.classList.add('active');
+      } else {
+        btn.classList.remove('active');
+      }
     }
+  });
+  renderChartData();
+}
 
-    const records = payload;
+function renderChartData() {
+  if (!telemetryChartInstance) return;
 
-    if (!Array.isArray(records) || records.length === 0) {
-      currentHistoricalRecords = [];
+  const labels = chartHistoryData.map(d => d.timestamp);
+
+  if (activeChartTab === 'telemetry') {
+    telemetryChartInstance.data.labels = labels;
+    telemetryChartInstance.data.datasets = [
+      { label: 'I1 Current (A)', data: chartHistoryData.map(d => d.i1), borderColor: '#f43f5e', tension: 0.3 },
+      { label: 'I2 Current (A)', data: chartHistoryData.map(d => d.i2), borderColor: '#eab308', tension: 0.3 },
+      { label: 'I3 Current (A)', data: chartHistoryData.map(d => d.i3), borderColor: '#3b82f6', tension: 0.3 }
+    ];
+  } else if (activeChartTab === 'voltages') {
+    telemetryChartInstance.data.labels = labels;
+    telemetryChartInstance.data.datasets = [
+      { label: 'V_R Voltage (V)', data: chartHistoryData.map(d => d.vR), borderColor: '#f43f5e', tension: 0.3 },
+      { label: 'V_Y Voltage (V)', data: chartHistoryData.map(d => d.vY), borderColor: '#eab308', tension: 0.3 },
+      { label: 'V_B Voltage (V)', data: chartHistoryData.map(d => d.vB), borderColor: '#3b82f6', tension: 0.3 }
+    ];
+  } else if (activeChartTab === 'climate') {
+    telemetryChartInstance.data.labels = labels;
+    telemetryChartInstance.data.datasets = [
+      { label: 'Temperature (°C)', data: chartHistoryData.map(d => d.temp), borderColor: '#f97316', tension: 0.3 },
+      { label: 'Humidity (%)', data: chartHistoryData.map(d => d.hum), borderColor: '#8b5cf6', tension: 0.3 }
+    ];
+  }
+  telemetryChartInstance.update();
+}
+
+// --------------------------------------------------------------------------
+// 7. HISTORICAL DATA SEARCH, TABLE RENDERING & EXPORTS
+// --------------------------------------------------------------------------
+
+async function searchHistoricalData() {
+  if (!selectedPanelId) {
+    alert("Please select a panel first.");
+    return;
+  }
+
+  const startDateInput = document.getElementById('histStartDate');
+  const endDateInput = document.getElementById('histEndDate');
+
+  const startDate = startDateInput ? startDateInput.value : '';
+  const endDate = endDateInput ? endDateInput.value : '';
+
+  let url = `${HISTORY_ENDPOINT}?panel_id=${encodeURIComponent(selectedPanelId)}`;
+  if (startDate) url += `&start_date=${encodeURIComponent(startDate)}`;
+  if (endDate) url += `&end_date=${encodeURIComponent(endDate)}`;
+
+  const tableBody = document.getElementById('histTableBody');
+  if (tableBody) {
+    tableBody.innerHTML = `<tr><td colspan="15" style="text-align: center; color: var(--text-muted); padding: 20px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading panel records...</td></tr>`;
+  }
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
       renderHistoricalTable([]);
-      showHistoryMessage('No historical records found.');
       return;
     }
+    const data = await response.json();
+    currentHistoricalRecords = Array.isArray(data) ? data : (data.records || []);
 
-    currentHistoricalRecords = records;
-    isShowingHistorical = true;
-    document.getElementById('resetLiveBtn').disabled = false;
+    // Enforce frontend panel isolation safety
+    currentHistoricalRecords = currentHistoricalRecords.filter(r => !r.panel_id || r.panel_id === selectedPanelId);
 
-    hideHistoryMessage();
-    renderHistoricalTable(records);
-    updateHistoricalChart(records);
-
-  } catch (err) {
-    console.error('Error fetching historical data from FastAPI:', err);
-    currentHistoricalRecords = [];
-    showHistoryMessage(err.message || 'Unable to load historical records. Please try again.');
+    renderHistoricalTable(currentHistoricalRecords);
+  } catch (error) {
+    console.error("Error fetching historical data:", error);
+    renderHistoricalTable([]);
   }
 }
 
-/* ==========================================================================
-   CHANGE 5: REFRESH BUTTON
-   Resets the entire Historical Data Logs & Export section back to its
-   default empty state:
-     - Clears Start Date, End Date, Panel ID inputs
-     - Clears the searched history table and in-memory records
-     - Clears the historical chart and returns the shared chart to Live mode
-     - Disables "Show Live Chart" until another search is performed
-   ========================================================================== */
-function refreshHistoricalData() {
-  // Clear filter inputs
-  document.getElementById('histStart').value = '';
-  document.getElementById('histEnd').value = '';
-  document.getElementById('histPanelId').value = '';
-
-  // Clear searched history / in-memory records
-  currentHistoricalRecords = [];
-  renderHistoricalTable([]);
-  showHistoryMessage('Select a date range and click Search to view historical records.');
-
-  // Return chart to Live mode and clear any historical chart data
-  isShowingHistorical = false;
-  document.getElementById('resetLiveBtn').disabled = true;
-  updateChartDatasets();
-}
-
-// Renders the Historical Records table using the EXACT fields returned by
-// /history - CHANGE 2 & 3: no averages are calculated, every row's Fault
-// Status comes strictly from that row's own record, and Relay Currents
-// (including I0 Earth) go through resolveRelayCurrents() so they are the
-// At-Trip values whenever a fault was active on that row.
 function renderHistoricalTable(records) {
-  const tbody = document.getElementById('historyTableBody');
-  if (!tbody) return;
+  const tableBody = document.getElementById('histTableBody');
+  const recordCountEl = document.getElementById('histRecordCount');
+  if (!tableBody) return;
 
-  tbody.innerHTML = '';
+  if (recordCountEl) recordCountEl.textContent = records.length;
 
   if (!records || records.length === 0) {
+    tableBody.innerHTML = `<tr><td colspan="15" style="text-align: center; color: var(--text-dim); padding: 20px;">No historical records found for ${selectedPanelId}.</td></tr>`;
     return;
   }
 
-  records.forEach((r, index) => {
-    const row = document.createElement('tr');
+  tableBody.innerHTML = '';
+  records.forEach((rec, idx) => {
+    const tr = document.createElement('tr');
+    const faultStatus = rec.fault_status || 'No Fault Detected';
+    const isFaulted = faultStatus !== 'No Fault Detected' && !faultStatus.toLowerCase().includes('normal');
+    const badgeClass = isFaulted ? 'fault-badge fault-bad' : 'fault-badge fault-ok';
 
-    const dt = r.timestamp ? new Date(r.timestamp) : null;
-    const validDt = dt && !isNaN(dt.getTime());
-    const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '--');
-    const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '--') : '--');
-
-    // Fault status is read fresh from THIS row's own record only - the
-    // backend already resolves it to one of the three canonical strings,
-    // so no other row's value can ever be echoed here.
-    const rawFault = r.live_fault_status || r.historical_fault_status || r.fault_status;
-    const faultStatus = (rawFault && String(rawFault).trim()) ? String(rawFault).trim() : 'No Fault Detected';
-    const isFaulted = isActiveFault(faultStatus);
-
-    // Fault-aware relay currents - fr_attrip_* on a faulted row, live
-    // relay_* otherwise. Same resolver used by the chart and both exports.
-    // (Historical Records module only - see resolveRelayCurrents() note.)
-    const cur = resolveRelayCurrents(r);
-
-    row.innerHTML = `
-      <td>${dateStr}</td>
-      <td>${timeStr}</td>
-      <td>${r.panel_id ?? '--'}</td>
-      <td>${fmtNum(r.meter_v_r, 1)} V</td>
-      <td>${fmtNum(r.meter_v_y, 1)} V</td>
-      <td>${fmtNum(r.meter_v_b, 1)} V</td>
-      <td>${fmtNum(r.meter_i_r, 2)} A</td>
-      <td>${fmtNum(r.meter_i_y, 2)} A</td>
-      <td>${fmtNum(r.meter_i_b, 2)} A</td>
-      <td>${fmtNum(cur.i1, 2)} A</td>
-      <td>${fmtNum(cur.i2, 2)} A</td>
-      <td>${fmtNum(cur.i3, 2)} A</td>
-      <td>${fmtNum(cur.i0, 2)} A</td>
-      <td><span class="fault-badge ${isFaulted ? 'fault-bad' : 'fault-ok'}">${faultStatus}</span></td>
-      <td class="action-col">
-        <button class="view-details-btn" onclick="viewRecordDetails(${index})">
-          <i class="fa-solid fa-eye"></i> View Details
+    tr.innerHTML = `
+      <td>${rec.timestamp || rec.created_at || '--'}</td>
+      <td><strong>${rec.panel_id || selectedPanelId}</strong></td>
+      <td><span class="${badgeClass}">${faultStatus}</span></td>
+      <td>${rec.i1 !== undefined ? rec.i1 : '--'}</td>
+      <td>${rec.i2 !== undefined ? rec.i2 : '--'}</td>
+      <td>${rec.i3 !== undefined ? rec.i3 : '--'}</td>
+      <td>${rec.i0 !== undefined ? rec.i0 : '--'}</td>
+      <td>${rec.vr !== undefined ? rec.vr : '--'}</td>
+      <td>${rec.vy !== undefined ? rec.vy : '--'}</td>
+      <td>${rec.vb !== undefined ? rec.vb : '--'}</td>
+      <td>${rec.total_power_p_t !== undefined ? rec.total_power_p_t : '--'}</td>
+      <td>${rec.total_power_factor !== undefined ? rec.total_power_factor : '--'}</td>
+      <td>${rec.temperature !== undefined ? rec.temperature : '--'}</td>
+      <td>${rec.humidity !== undefined ? rec.humidity : '--'}</td>
+      <td>
+        <button class="view-details-btn" onclick="openDetailsModal(${idx})">
+          <i class="fa-solid fa-eye"></i> Details
         </button>
       </td>
     `;
-
-    tbody.appendChild(row);
+    tableBody.appendChild(tr);
   });
 }
 
-// Plots the shared telemetry chart using historical records from /history.
-// Relay currents go through resolveRelayCurrents() for every record, so
-// this automatically plots At-Trip currents for any record with an active
-// fault, and genuine live currents otherwise - matching the table exactly.
-function updateHistoricalChart(records) {
-  if (!chartInstance) return;
-
-  if (!records || records.length === 0) {
-    chartInstance.data.labels = [];
-    chartInstance.data.datasets = [];
-    chartInstance.update();
-    return;
-  }
-
-  const timestamps = records.map(r => {
-    const dt = new Date(r.timestamp);
-    return !isNaN(dt.getTime()) ? `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}` : String(r.timestamp);
-  });
-
-  if (activeChartMode === 'currents') {
-    const resolved = records.map(r => resolveRelayCurrents(r));
-    chartInstance.data.datasets = [
-      { label: 'Relay I1 (A)', data: resolved.map(c => numOrNull(c.i1)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I2 (A)', data: resolved.map(c => numOrNull(c.i2)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I3 (A)', data: resolved.map(c => numOrNull(c.i3)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 },
-      { label: 'Relay I0 Earth (A)', data: resolved.map(c => numOrNull(c.i0)), borderColor: '#10b981', tension: 0.3, borderWidth: 2 }
-    ];
-  } else if (activeChartMode === 'voltages') {
-    chartInstance.data.datasets = [
-      { label: 'Meter V_R (V)', data: records.map(r => numOrNull(r.meter_v_r)), borderColor: '#f43f5e', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_Y (V)', data: records.map(r => numOrNull(r.meter_v_y)), borderColor: '#eab308', tension: 0.3, borderWidth: 2 },
-      { label: 'Meter V_B (V)', data: records.map(r => numOrNull(r.meter_v_b)), borderColor: '#3b82f6', tension: 0.3, borderWidth: 2 }
-    ];
-  } else if (activeChartMode === 'environment') {
-    chartInstance.data.datasets = [
-      { label: 'Temp (°C)', data: records.map(r => numOrNull(r.temperature)), borderColor: '#f97316', tension: 0.3, borderWidth: 2 },
-      { label: 'Humidity (%)', data: records.map(r => numOrNull(r.humidity)), borderColor: '#06b6d4', tension: 0.3, borderWidth: 2 }
-    ];
-  }
-
-  chartInstance.data.labels = timestamps;
-  chartInstance.update();
+function resetHistoricalFilter() {
+  const startDateInput = document.getElementById('histStartDate');
+  const endDateInput = document.getElementById('histEndDate');
+  if (startDateInput) startDateInput.value = '';
+  if (endDateInput) endDateInput.value = '';
+  searchHistoricalData();
 }
 
-// "Show Live Chart" - return to live /latest polling on the shared chart
-function resetToLiveChart() {
-  isShowingHistorical = false;
-  document.getElementById('resetLiveBtn').disabled = true;
-  updateChartDatasets();
+function clearHistoricalTable() {
+  currentHistoricalRecords = [];
+  renderHistoricalTable([]);
 }
 
-// Builds a flat, export-friendly row shape shared by Excel & PDF export.
-// Mirrors the Historical Records table columns exactly (CHANGE 2, plus the
-// Relay I0 Earth column) so what the user sees on screen is what gets
-// exported - no averages, and no live-vs-At-Trip mismatch. Relay currents
-// go through the same resolveRelayCurrents() resolver as the table/chart.
-function buildExportRows(records) {
-  return records.map(r => {
-    const dt = r.timestamp ? new Date(r.timestamp) : null;
-    const validDt = dt && !isNaN(dt.getTime());
-    const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
-    const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
+// --------------------------------------------------------------------------
+// 8. VIEW DETAILS MODAL POPUP
+// --------------------------------------------------------------------------
 
-    const rawFault = r.live_fault_status || r.historical_fault_status || r.fault_status;
-    const faultStatus = (rawFault && String(rawFault).trim()) ? String(rawFault).trim() : 'No Fault Detected';
+function openDetailsModal(index) {
+  const rec = currentHistoricalRecords[index];
+  if (!rec) return;
 
-    // Historical Records module - fault-aware resolver applies here.
-    const cur = resolveRelayCurrents(r);
+  const modalBody = document.getElementById('modalBody');
+  const modal = document.getElementById('recordDetailsModal');
+  if (!modalBody || !modal) return;
 
-    return {
-      Date: dateStr,
-      Time: timeStr,
-      'Panel ID': r.panel_id ?? '',
-      'Meter Voltage R (V)': fmtNum(r.meter_v_r, 1),
-      'Meter Voltage Y (V)': fmtNum(r.meter_v_y, 1),
-      'Meter Voltage B (V)': fmtNum(r.meter_v_b, 1),
-      'Meter Current R (A)': fmtNum(r.meter_i_r, 2),
-      'Meter Current Y (A)': fmtNum(r.meter_i_y, 2),
-      'Meter Current B (A)': fmtNum(r.meter_i_b, 2),
-      'Relay Current I1 (A)': fmtNum(cur.i1, 2),
-      'Relay Current I2 (A)': fmtNum(cur.i2, 2),
-      'Relay Current I3 (A)': fmtNum(cur.i3, 2),
-      'Relay Current I0 Earth (A)': fmtNum(cur.i0, 2),
-      'Fault Status': faultStatus
-    };
-  });
-}
-
-// Export currently displayed records to an Excel (.xlsx) file
-function exportExcel() {
-  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
-    alert('No historical records to export. Please search first.');
-    return;
-  }
-
-  const rows = buildExportRows(currentHistoricalRecords);
-  const worksheet = XLSX.utils.json_to_sheet(rows);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Historical Data');
-  XLSX.writeFile(workbook, `historical_data_${new Date().toISOString().slice(0, 10)}.xlsx`);
-}
-
-// Export currently displayed records to a PDF file
-function exportPDF() {
-  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
-    alert('No historical records to export. Please search first.');
-    return;
-  }
-
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF();
-
-  doc.setFontSize(14);
-  doc.text('Historical Data Export - MV Panel Monitoring System', 14, 15);
-
-  const rows = buildExportRows(currentHistoricalRecords);
-  const head = [Object.keys(rows[0])];
-  const body = rows.map(r => Object.values(r));
-
-  doc.autoTable({
-    head,
-    body,
-    startY: 22,
-    styles: { fontSize: 7 },
-    headStyles: { fillColor: [6, 182, 212] }
-  });
-
-  doc.save(`historical_data_${new Date().toISOString().slice(0, 10)}.pdf`);
-}
-
-// DELETE /history?start_date=...&end_date=...&panel_id=...
-async function clearHistoricalData() {
-  const { startDate, endDate, panelId } = getHistoryFilters();
-
-  if (!startDate || !endDate) {
-    alert('Please select Start Date and End Date before clearing data.');
-    return;
-  }
-
-  if (new Date(startDate) > new Date(endDate)) {
-    alert('Start date/time cannot be after End date/time.');
-    return;
-  }
-
-  const confirmMsg = panelId
-    ? `Delete all historical records for Panel "${panelId}" between the selected dates? This action is permanent!`
-    : `Delete ALL historical records between the selected dates? This action is permanent!`;
-
-  if (!confirm(confirmMsg)) {
-    return;
-  }
-
-  const params = new URLSearchParams();
-  params.set('start_date', startDate);
-  params.set('end_date', endDate);
-  if (panelId) params.set('panel_id', panelId);
-
-  try {
-    const response = await fetch(`${DELETE_HISTORY_ENDPOINT}?${params.toString()}`, {
-      method: 'DELETE'
-    });
-
-    const payload = await safeReadJson(response);
-
-    if (!response.ok) {
-      const detail = (payload && payload.detail) ? payload.detail : `Request failed (HTTP ${response.status}).`;
-      throw new Error(detail);
-    }
-
-    // Show the backend's real message/count rather than a hardcoded string.
-    const message = (payload && payload.message)
-      ? payload.message
-      : 'Historical records deleted successfully.';
-    alert(message);
-
-    // Refresh the table and graph with whatever remains for this filter
-    await fetchHistoricalData();
-
-  } catch (err) {
-    console.error('Error deleting historical data via FastAPI:', err);
-    alert(err.message || 'Error deleting historical records. Please try again.');
-  }
-}
-
-/* ==========================================================================
-   VIEW DETAILS MODAL (CHANGE 4)
-   ==========================================================================
-   Opens a popup showing every value stored for the selected database
-   record. No new API call is made - the record already lives in
-   `currentHistoricalRecords` (the same array the table and export use).
-
-   All field names below match the exact PostgreSQL column names returned
-   by GET /history in main.py (relay_i1, pickup_phase,
-   current_relay_status, relay_rtc, event_type, fault_status,
-   live_fault_status, historical_fault_status, operation_counter,
-   negative_sequence_current, thermal_level, fr_prestart_i1, etc.).
-   `pick()` is kept as a thin safety net in case a deployment uses
-   slightly different column names - it simply returns the first
-   candidate key that has a value.
-
-   The "Relay Currents" section below follows the SAME fault-aware logic
-   as the Historical Records table/chart (via resolveRelayCurrents()):
-   fr_attrip_* on a row where overcurrent_fault or earth_fault is true,
-   relay_* otherwise. The separate "Fault Record -> At Trip" section
-   further down intentionally reads fr_attrip_i1..i0 directly (raw,
-   unconditional, regardless of fault flags) - it is the relay's
-   permanent trip-event record and is preserved exactly as-is.
-   ========================================================================== */
-
-// Tries each candidate key (in order) against a record and returns the
-// first defined, non-null value found. Returns null if none match.
-function pick(record, candidates) {
-  for (const key of candidates) {
-    const val = record?.[key];
-    if (val !== undefined && val !== null && val !== '') return val;
-  }
-  return null;
-}
-
-// Formats a raw value for display inside the modal: numbers get fixed
-// decimals when a unit is supplied, everything else is shown as-is.
-function fmtDetail(val, unit = '', decimals = null) {
-  if (val === null || val === undefined || val === '') return '--';
-  if (decimals !== null && !isInvalid(val)) {
-    return `${Number(val).toFixed(decimals)}${unit ? ' ' + unit : ''}`;
-  }
-  return `${val}${unit ? ' ' + unit : ''}`;
-}
-
-// Builds one label/value "detail-field" box
-function detailFieldHTML(label, value) {
-  return `
-    <div class="detail-field">
-      <span class="detail-field-label">${label}</span>
-      <span class="detail-field-value">${value}</span>
-    </div>
-  `;
-}
-
-// Builds a full section card: title + icon + a grid of detail fields
-function detailSectionHTML(icon, title, fieldsHTML) {
-  return `
+  modalBody.innerHTML = `
     <div class="detail-section">
-      <div class="detail-section-title"><i class="${icon}"></i> ${title}</div>
+      <div class="detail-section-title"><i class="fa-solid fa-microchip"></i> Basic Information</div>
       <div class="detail-fields-grid">
-        ${fieldsHTML}
+        <div class="detail-field">
+          <span class="detail-field-label">Panel ID</span>
+          <span class="detail-field-value highlight-cyan">${rec.panel_id || selectedPanelId}</span>
+        </div>
+        <div class="detail-field">
+          <span class="detail-field-label">Customer ID</span>
+          <span class="detail-field-value">${currentCustomer || '--'}</span>
+        </div>
+        <div class="detail-field">
+          <span class="detail-field-label">Timestamp</span>
+          <span class="detail-field-value">${rec.timestamp || rec.created_at || '--'}</span>
+        </div>
+        <div class="detail-field">
+          <span class="detail-field-label">Fault Status</span>
+          <span class="detail-field-value highlight-yellow">${rec.fault_status || 'No Fault Detected'}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-title"><i class="fa-solid fa-shield-halved"></i> ABB REJ601 Relay Telemetry</div>
+      <div class="detail-fields-grid">
+        <div class="detail-field"><span class="detail-field-label">Phase I1</span><span class="detail-field-value">${rec.i1 || 0} A</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase I2</span><span class="detail-field-value">${rec.i2 || 0} A</span></div>
+        <div class="detail-field"><span class="detail-field-label">Phase I3</span><span class="detail-field-value">${rec.i3 || 0} A</span></div>
+        <div class="detail-field"><span class="detail-field-label">Earth I0</span><span class="detail-field-value">${rec.i0 || 0} A</span></div>
+        <div class="detail-field"><span class="detail-field-label">Negative Seq I2</span><span class="detail-field-value">${rec.negative_sequence_i2 || 0} A</span></div>
+        <div class="detail-field"><span class="detail-field-label">Thermal Level</span><span class="detail-field-value">${rec.thermal_level || 0} %</span></div>
+      </div>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-title"><i class="fa-solid fa-gauge-high"></i> EMS-01 Power Quality Meter</div>
+      <div class="detail-fields-grid">
+        <div class="detail-field"><span class="detail-field-label">V_R Voltage</span><span class="detail-field-value">${rec.vr || 0} V</span></div>
+        <div class="detail-field"><span class="detail-field-label">V_Y Voltage</span><span class="detail-field-value">${rec.vy || 0} V</span></div>
+        <div class="detail-field"><span class="detail-field-label">V_B Voltage</span><span class="detail-field-value">${rec.vb || 0} V</span></div>
+        <div class="detail-field"><span class="detail-field-label">Total Power</span><span class="detail-field-value highlight-green">${rec.total_power_p_t || 0} kW</span></div>
+        <div class="detail-field"><span class="detail-field-label">Total PF</span><span class="detail-field-value">${rec.total_power_factor || 0}</span></div>
+        <div class="detail-field"><span class="detail-field-label">Frequency</span><span class="detail-field-value">${rec.frequency || 50.0} Hz</span></div>
+      </div>
+    </div>
+
+    <div class="detail-section">
+      <div class="detail-section-title"><i class="fa-solid fa-temperature-half"></i> DHT22 Environmental Data</div>
+      <div class="detail-fields-grid">
+        <div class="detail-field"><span class="detail-field-label">Temperature</span><span class="detail-field-value highlight-orange">${rec.temperature || 0} °C</span></div>
+        <div class="detail-field"><span class="detail-field-label">Humidity</span><span class="detail-field-value highlight-purple">${rec.humidity || 0} %</span></div>
       </div>
     </div>
   `;
+
+  modal.classList.remove('hidden');
 }
 
-// Opens the modal for the record at the given index within
-// currentHistoricalRecords (index comes from the "View Details" button).
-function viewRecordDetails(index) {
-  const record = currentHistoricalRecords[index];
-  if (!record) {
-    alert('Unable to load this record. Please search again.');
+function closeDetailsModal() {
+  const modal = document.getElementById('recordDetailsModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+// --------------------------------------------------------------------------
+// 9. EXPORTS (EXCEL & PDF)
+// --------------------------------------------------------------------------
+
+function exportHistoricalExcel() {
+  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
+    alert("No records to export.");
     return;
   }
 
-  renderRecordDetailsModal(record);
+  const exportData = currentHistoricalRecords.map(r => ({
+    "Timestamp": r.timestamp || r.created_at || "",
+    "Customer ID": currentCustomer || "",
+    "Panel ID": r.panel_id || selectedPanelId,
+    "Fault Status": r.fault_status || "No Fault Detected",
+    "I1 Current (A)": r.i1 !== undefined ? r.i1 : "",
+    "I2 Current (A)": r.i2 !== undefined ? r.i2 : "",
+    "I3 Current (A)": r.i3 !== undefined ? r.i3 : "",
+    "I0 Earth (A)": r.i0 !== undefined ? r.i0 : "",
+    "VR Voltage (V)": r.vr !== undefined ? r.vr : "",
+    "VY Voltage (V)": r.vy !== undefined ? r.vy : "",
+    "VB Voltage (V)": r.vb !== undefined ? r.vb : "",
+    "Total Power (kW)": r.total_power_p_t !== undefined ? r.total_power_p_t : "",
+    "Power Factor": r.total_power_factor !== undefined ? r.total_power_factor : "",
+    "Temperature (°C)": r.temperature !== undefined ? r.temperature : "",
+    "Humidity (%)": r.humidity !== undefined ? r.humidity : ""
+  }));
 
-  document.getElementById('recordDetailsOverlay').classList.remove('hidden');
-  // Track which record is open so the export buttons know what to export.
-  document.getElementById('recordDetailsOverlay').dataset.recordIndex = index;
-}
-
-function closeRecordDetails() {
-  document.getElementById('recordDetailsOverlay').classList.add('hidden');
-}
-
-// Close the modal when clicking the dark overlay background (not the box itself)
-document.addEventListener('DOMContentLoaded', () => {
-  const overlay = document.getElementById('recordDetailsOverlay');
-  if (overlay) {
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) closeRecordDetails();
-    });
-  }
-  // Close on Escape key
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      const ov = document.getElementById('recordDetailsOverlay');
-      if (ov && !ov.classList.contains('hidden')) closeRecordDetails();
-    }
-  });
-});
-
-// Builds and injects all section cards for the given record.
-// CHANGE 4 & 6: sections are grouped exactly as requested - Basic
-// Information, Meter Voltages, Meter Currents, Relay Currents, Relay
-// Settings, Fault Information, Environmental Data - plus the original
-// Event Information and Fault Record (Pre-start/At-Start/At-Trip) detail,
-// which are preserved (not removed) as additional sections.
-function renderRecordDetailsModal(r) {
-  const modalBody = document.getElementById('modalBody');
-  if (!modalBody) return;
-
-  const dt = r.timestamp ? new Date(r.timestamp) : null;
-  const validDt = dt && !isNaN(dt.getTime());
-  const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '--');
-  const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '--') : '--');
-
-  document.getElementById('modalTitle').innerText = `Record Details - Panel ${r.panel_id ?? '--'}`;
-
-  let html = '';
-
-  // -------------------- SECTION: BASIC INFORMATION --------------------
-  html += detailSectionHTML('fa-solid fa-circle-info', 'Basic Information',
-    detailFieldHTML('Date', fmtDetail(dateStr)) +
-    detailFieldHTML('Time', fmtDetail(timeStr)) +
-    detailFieldHTML('Panel ID', fmtDetail(r.panel_id)) +
-    detailFieldHTML('Relay Status', fmtDetail(pick(r, ['current_relay_status', 'relay_status']))) +
-    detailFieldHTML('Relay RTC', fmtDetail(pick(r, ['relay_rtc', 'rtc'])))
-  );
-
-  // -------------------- SECTION: METER VOLTAGES --------------------
-  html += detailSectionHTML('fa-solid fa-car-battery', 'Meter Voltages',
-    detailFieldHTML('Voltage R', fmtDetail(r.meter_v_r, 'V', 1)) +
-    detailFieldHTML('Voltage Y', fmtDetail(r.meter_v_y, 'V', 1)) +
-    detailFieldHTML('Voltage B', fmtDetail(r.meter_v_b, 'V', 1)) +
-    detailFieldHTML('Frequency', fmtDetail(r.meter_frequency, 'Hz', 2))
-  );
-
-  // -------------------- SECTION: METER CURRENTS --------------------
-  html += detailSectionHTML('fa-solid fa-bolt', 'Meter Currents',
-    detailFieldHTML('Current R', fmtDetail(pick(r, ['meter_i_r']), 'A', 2)) +
-    detailFieldHTML('Current Y', fmtDetail(pick(r, ['meter_i_y']), 'A', 2)) +
-    detailFieldHTML('Current B', fmtDetail(pick(r, ['meter_i_b']), 'A', 2)) +
-    detailFieldHTML('PF - R', fmtDetail(pick(r, ['meter_pf_r']), '', 2)) +
-    detailFieldHTML('PF - Y', fmtDetail(pick(r, ['meter_pf_y']), '', 2)) +
-    detailFieldHTML('PF - B', fmtDetail(pick(r, ['meter_pf_b']), '', 2)) +
-    detailFieldHTML('Total PF', fmtDetail(pick(r, ['meter_pf_t']), '', 2)) +
-    detailFieldHTML('Power R', fmtDetail(pick(r, ['meter_p_r']), 'kW', 2)) +
-    detailFieldHTML('Power Y', fmtDetail(pick(r, ['meter_p_y']), 'kW', 2)) +
-    detailFieldHTML('Power B', fmtDetail(pick(r, ['meter_p_b']), 'kW', 2)) +
-    detailFieldHTML('Total Power', fmtDetail(pick(r, ['meter_p_t']), 'kW', 2))
-  );
-
-  // -------------------- SECTION: RELAY CURRENTS --------------------
-  // Same fault-aware logic as the Historical Records table/chart: on a
-  // faulted row (overcurrent_fault or earth_fault true) this shows the
-  // relay's At-Trip snapshot (fr_attrip_*); on a normal row it shows the
-  // genuine relay_i1..i0 reading. Uses the SAME resolveRelayCurrents()
-  // resolver as the table, so it can never disagree with it. The
-  // separate "Fault Record" section further below always shows the raw
-  // fr_attrip_* (and pre-start/at-start/+80%/+200%) values unconditionally,
-  // regardless of this section.
-  const relayCurDetail = resolveRelayCurrents(r);
-  html += detailSectionHTML('fa-solid fa-shield-halved', 'Relay Currents',
-    detailFieldHTML('Relay I1', fmtDetail(relayCurDetail.i1, 'A', 2)) +
-    detailFieldHTML('Relay I2', fmtDetail(relayCurDetail.i2, 'A', 2)) +
-    detailFieldHTML('Relay I3', fmtDetail(relayCurDetail.i3, 'A', 2)) +
-    detailFieldHTML('Relay I0 (Earth)', fmtDetail(relayCurDetail.i0, 'A', 2))
-  );
-
-  // -------------------- SECTION: RELAY SETTINGS --------------------
-  html += detailSectionHTML('fa-solid fa-sliders', 'Relay Settings',
-    detailFieldHTML('Relay Pickup Phase', fmtDetail(pick(r, ['pickup_phase', 'relay_pickup_phase']), 'A', 2)) +
-    detailFieldHTML('Relay Pickup Earth', fmtDetail(pick(r, ['pickup_earth', 'relay_pickup_earth']), 'A', 2)) +
-    detailFieldHTML('Operation Counter', fmtDetail(pick(r, ['operation_counter', 'op_counter']))) +
-    detailFieldHTML('Negative Sequence Current', fmtDetail(pick(r, ['negative_sequence_current', 'neg_seq']), 'A', 2)) +
-    detailFieldHTML('Thermal Level', fmtDetail(pick(r, ['thermal_level']), '%'))
-  );
-
-  // -------------------- SECTION: FAULT INFORMATION --------------------
-  html += detailSectionHTML('fa-solid fa-triangle-exclamation', 'Fault Information',
-    detailFieldHTML('Fault Status', fmtDetail(pick(r, ['fault_status']))) +
-    detailFieldHTML('Live Fault Status', fmtDetail(pick(r, ['live_fault_status']))) +
-    detailFieldHTML('Historical Fault Status', fmtDetail(pick(r, ['historical_fault_status'])))
-  );
-
-  // -------------------- SECTION: ENVIRONMENTAL DATA --------------------
-  html += detailSectionHTML('fa-solid fa-cloud-sun-rain', 'Environmental Data',
-    detailFieldHTML('Temperature', fmtDetail(r.temperature, '°C', 1)) +
-    detailFieldHTML('Humidity', fmtDetail(r.humidity, '%', 1))
-  );
-
-  // -------------------- SECTION: EVENT INFORMATION (preserved) --------------------
-  html += detailSectionHTML('fa-solid fa-list-check', 'Event Information',
-    detailFieldHTML('Event Type', fmtDetail(pick(r, ['event_type']))) +
-    detailFieldHTML('Event Subtype', fmtDetail(pick(r, ['event_subtype']))) +
-    detailFieldHTML('Event Timestamp', fmtDetail(pick(r, ['event_timestamp'])))
-  );
-
-  // -------------------- SECTION: FAULT RECORD (preserved) --------------------
-  const preStartFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_prestart_i1', 'fr_pre_start_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_prestart_i2', 'fr_pre_start_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_prestart_i3', 'fr_pre_start_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_prestart_i0', 'fr_pre_start_i0']), 'A', 2));
-
-  const atStartFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_atstart_i1', 'fr_at_start_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_atstart_i2', 'fr_at_start_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_atstart_i3', 'fr_at_start_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_atstart_i0', 'fr_at_start_i0']), 'A', 2)) +
-    detailFieldHTML('Start Timestamp', fmtDetail(pick(r, ['fr_atstart_timestamp', 'fr_at_start_time'])));
-
-  const atTripFields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_attrip_i1', 'fr_at_trip_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_attrip_i2', 'fr_at_trip_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_attrip_i3', 'fr_at_trip_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_attrip_i0', 'fr_at_trip_i0']), 'A', 2)) +
-    detailFieldHTML('Trip Timestamp', fmtDetail(pick(r, ['fr_attrip_timestamp', 'fr_at_trip_time'])));
-
-  const p80Fields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_p80_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_p80_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_p80_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_p80_i0']), 'A', 2));
-
-  const p200Fields =
-    detailFieldHTML('I1', fmtDetail(pick(r, ['fr_p200_i1']), 'A', 2)) +
-    detailFieldHTML('I2', fmtDetail(pick(r, ['fr_p200_i2']), 'A', 2)) +
-    detailFieldHTML('I3', fmtDetail(pick(r, ['fr_p200_i3']), 'A', 2)) +
-    detailFieldHTML('I0', fmtDetail(pick(r, ['fr_p200_i0']), 'A', 2));
-
-  const faultRecordFields = `
-    <div class="detail-subgroup">
-      <div class="detail-subgroup-title">Pre Start</div>
-      <div class="detail-fields-grid">${preStartFields}</div>
-    </div>
-    <div class="detail-subgroup">
-      <div class="detail-subgroup-title">At Start</div>
-      <div class="detail-fields-grid">${atStartFields}</div>
-    </div>
-    <div class="detail-subgroup trip-subgroup">
-      <div class="detail-subgroup-title">At Trip</div>
-      <div class="detail-fields-grid">${atTripFields}</div>
-    </div>
-    <div class="detail-subgroup">
-      <div class="detail-subgroup-title">+80% Post Trip</div>
-      <div class="detail-fields-grid">${p80Fields}</div>
-    </div>
-    <div class="detail-subgroup">
-      <div class="detail-subgroup-title">+200% Post Trip</div>
-      <div class="detail-fields-grid">${p200Fields}</div>
-    </div>
-  `;
-
-  html += `
-    <div class="detail-section">
-      <div class="detail-section-title"><i class="fa-solid fa-clock-rotate-left"></i> Fault Record</div>
-      ${faultRecordFields}
-    </div>
-  `;
-
-  modalBody.innerHTML = html;
-}
-
-// -------------------- Single-record export: Excel --------------------
-function exportRecordExcel() {
-  const overlay = document.getElementById('recordDetailsOverlay');
-  const index = Number(overlay.dataset.recordIndex);
-  const record = currentHistoricalRecords[index];
-  if (!record) {
-    alert('No record selected to export.');
-    return;
-  }
-
-  const rows = buildFullExportRow(record);
-  const worksheet = XLSX.utils.json_to_sheet([rows]);
+  const worksheet = XLSX.utils.json_to_sheet(exportData);
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Record Detail');
-  XLSX.writeFile(workbook, `record_${record.panel_id ?? 'panel'}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Telemetry Logs");
+
+  XLSX.writeFile(workbook, `Telemetry_Report_${selectedPanelId}_${new Date().toISOString().slice(0,10)}.xlsx`);
 }
 
-// -------------------- Single-record export: PDF --------------------
-function exportRecordPDF() {
-  const overlay = document.getElementById('recordDetailsOverlay');
-  const index = Number(overlay.dataset.recordIndex);
-  const record = currentHistoricalRecords[index];
-  if (!record) {
-    alert('No record selected to export.');
+function exportHistoricalPdf() {
+  if (!currentHistoricalRecords || currentHistoricalRecords.length === 0) {
+    alert("No records to export.");
     return;
   }
 
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF();
+  const doc = new jsPDF({ orientation: 'landscape' });
 
   doc.setFontSize(14);
-  doc.text(`Historical Record Detail - Panel ${record.panel_id ?? '--'}`, 14, 15);
+  doc.text(`MV Substation Telemetry Report - ${selectedPanelId}`, 14, 15);
+  doc.setFontSize(10);
+  doc.text(`Customer: ${currentCustomer} | Export Date: ${new Date().toLocaleString()}`, 14, 22);
 
-  const rowObj = buildFullExportRow(record);
-  const body = Object.entries(rowObj).map(([label, value]) => [label, String(value)]);
+  const tableColumn = ["Timestamp", "Panel", "Fault Status", "I1(A)", "I2(A)", "I3(A)", "I0(A)", "VR(V)", "VY(V)", "VB(V)", "P_T(kW)", "PF", "Temp(°C)", "Hum(%)"];
+  const tableRows = currentHistoricalRecords.map(r => [
+    r.timestamp || r.created_at || "",
+    r.panel_id || selectedPanelId,
+    r.fault_status || "Normal",
+    r.i1 !== undefined ? r.i1 : "",
+    r.i2 !== undefined ? r.i2 : "",
+    r.i3 !== undefined ? r.i3 : "",
+    r.i0 !== undefined ? r.i0 : "",
+    r.vr !== undefined ? r.vr : "",
+    r.vy !== undefined ? r.vy : "",
+    r.vb !== undefined ? r.vb : "",
+    r.total_power_p_t !== undefined ? r.total_power_p_t : "",
+    r.total_power_factor !== undefined ? r.total_power_factor : "",
+    r.temperature !== undefined ? r.temperature : "",
+    r.humidity !== undefined ? r.humidity : ""
+  ]);
 
   doc.autoTable({
-    head: [['Field', 'Value']],
-    body,
-    startY: 22,
-    styles: { fontSize: 8 },
+    head: [tableColumn],
+    body: tableRows,
+    startY: 28,
+    styles: { fontSize: 8, cellPadding: 2 },
     headStyles: { fillColor: [6, 182, 212] }
   });
 
-  doc.save(`record_${record.panel_id ?? 'panel'}_${new Date().toISOString().slice(0, 10)}.pdf`);
+  doc.save(`Telemetry_Report_${selectedPanelId}_${new Date().toISOString().slice(0,10)}.pdf`);
 }
 
-// Flattens every field shown in the modal into one label -> value object,
-// reused by both single-record export functions above. This mirrors the
-// modal exactly: "Relay Currents" here is the genuine relay_i1..i0 (never
-// At-Trip substituted), and the separate Fault Record fields below it
-// carry the fr_attrip_* / fr_prestart_* / etc. values unconditionally.
-function buildFullExportRow(r) {
-  const dt = r.timestamp ? new Date(r.timestamp) : null;
-  const validDt = dt && !isNaN(dt.getTime());
-  const dateStr = validDt ? dt.toLocaleDateString() : (r.timestamp ? String(r.timestamp).split(' ')[0] : '');
-  const timeStr = validDt ? dt.toLocaleTimeString() : (r.timestamp ? (String(r.timestamp).split(' ')[1] || '') : '');
+// --------------------------------------------------------------------------
+// 10. INITIALIZATION & SESSION RESTORATION
+// --------------------------------------------------------------------------
 
-  // Matches the "Relay Currents" modal section - same fault-aware
-  // resolveRelayCurrents() logic as the Historical Records table/chart
-  // (fr_attrip_* on a faulted row, relay_* otherwise). The separate
-  // Fault Record fields further below always carry the raw fr_attrip_*
-  // values unconditionally, regardless of this section.
-  const cur = resolveRelayCurrents(r);
+document.addEventListener('DOMContentLoaded', () => {
+  const savedCustomer = localStorage.getItem('mv_customer_id');
+  const savedPanel = localStorage.getItem('mv_panel_id');
 
-  return {
-    'Date': dateStr,
-    'Time': timeStr,
-    'Panel ID': r.panel_id ?? '',
-    'Relay Status': pick(r, ['current_relay_status', 'relay_status']) ?? '',
-    'Relay RTC': pick(r, ['relay_rtc', 'rtc']) ?? '',
+  if (savedCustomer && customerAccounts[savedCustomer]) {
+    currentCustomer = savedCustomer;
+    const assignedPanels = customerAccounts[savedCustomer].panels || [];
 
-    'Voltage R (V)': r.meter_v_r ?? '',
-    'Voltage Y (V)': r.meter_v_y ?? '',
-    'Voltage B (V)': r.meter_v_b ?? '',
-    'Frequency (Hz)': r.meter_frequency ?? '',
-
-    'Current R (A)': pick(r, ['meter_i_r']) ?? '',
-    'Current Y (A)': pick(r, ['meter_i_y']) ?? '',
-    'Current B (A)': pick(r, ['meter_i_b']) ?? '',
-    'PF-R': pick(r, ['meter_pf_r']) ?? '',
-    'PF-Y': pick(r, ['meter_pf_y']) ?? '',
-    'PF-B': pick(r, ['meter_pf_b']) ?? '',
-    'Total PF': pick(r, ['meter_pf_t']) ?? '',
-    'Power R (kW)': pick(r, ['meter_p_r']) ?? '',
-    'Power Y (kW)': pick(r, ['meter_p_y']) ?? '',
-    'Power B (kW)': pick(r, ['meter_p_b']) ?? '',
-    'Total Power (kW)': pick(r, ['meter_p_t']) ?? '',
-
-    'Relay I1 (A)': cur.i1 ?? '',
-    'Relay I2 (A)': cur.i2 ?? '',
-    'Relay I3 (A)': cur.i3 ?? '',
-    'Relay I0 (A)': cur.i0 ?? '',
-
-    'Relay Pickup Phase (A)': pick(r, ['pickup_phase', 'relay_pickup_phase']) ?? '',
-    'Relay Pickup Earth (A)': pick(r, ['pickup_earth', 'relay_pickup_earth']) ?? '',
-    'Operation Counter': pick(r, ['operation_counter', 'op_counter']) ?? '',
-    'Negative Sequence Current (A)': pick(r, ['negative_sequence_current', 'neg_seq']) ?? '',
-    'Thermal Level (%)': pick(r, ['thermal_level']) ?? '',
-
-    'Fault Status': pick(r, ['fault_status']) ?? '',
-    'Live Fault Status': pick(r, ['live_fault_status']) ?? '',
-    'Historical Fault Status': pick(r, ['historical_fault_status']) ?? '',
-
-    'Temperature (C)': r.temperature ?? '',
-    'Humidity (%)': r.humidity ?? '',
-
-    'Event Type': pick(r, ['event_type']) ?? '',
-    'Event Subtype': pick(r, ['event_subtype']) ?? '',
-    'Event Timestamp': pick(r, ['event_timestamp']) ?? '',
-
-    'Fault Record Pre-Start I1 (A)': pick(r, ['fr_prestart_i1']) ?? '',
-    'Fault Record Pre-Start I2 (A)': pick(r, ['fr_prestart_i2']) ?? '',
-    'Fault Record Pre-Start I3 (A)': pick(r, ['fr_prestart_i3']) ?? '',
-    'Fault Record Pre-Start I0 (A)': pick(r, ['fr_prestart_i0']) ?? '',
-
-    'Fault Record At-Start I1 (A)': pick(r, ['fr_atstart_i1']) ?? '',
-    'Fault Record At-Start I2 (A)': pick(r, ['fr_atstart_i2']) ?? '',
-    'Fault Record At-Start I3 (A)': pick(r, ['fr_atstart_i3']) ?? '',
-    'Fault Record At-Start I0 (A)': pick(r, ['fr_atstart_i0']) ?? '',
-    'Fault Record Start Timestamp': pick(r, ['fr_atstart_timestamp']) ?? '',
-
-    'Fault Record At-Trip I1 (A)': pick(r, ['fr_attrip_i1']) ?? '',
-    'Fault Record At-Trip I2 (A)': pick(r, ['fr_attrip_i2']) ?? '',
-    'Fault Record At-Trip I3 (A)': pick(r, ['fr_attrip_i3']) ?? '',
-    'Fault Record At-Trip I0 (A)': pick(r, ['fr_attrip_i0']) ?? '',
-    'Fault Record Trip Timestamp': pick(r, ['fr_attrip_timestamp']) ?? '',
-
-    'Fault Record +80% I1 (A)': pick(r, ['fr_p80_i1']) ?? '',
-    'Fault Record +80% I2 (A)': pick(r, ['fr_p80_i2']) ?? '',
-    'Fault Record +80% I3 (A)': pick(r, ['fr_p80_i3']) ?? '',
-    'Fault Record +80% I0 (A)': pick(r, ['fr_p80_i0']) ?? '',
-
-    'Fault Record +200% I1 (A)': pick(r, ['fr_p200_i1']) ?? '',
-    'Fault Record +200% I2 (A)': pick(r, ['fr_p200_i2']) ?? '',
-    'Fault Record +200% I3 (A)': pick(r, ['fr_p200_i3']) ?? '',
-    'Fault Record +200% I0 (A)': pick(r, ['fr_p200_i0']) ?? ''
-  };
-}
+    if (savedPanel && assignedPanels.includes(savedPanel)) {
+      selectPanel(savedPanel);
+    } else {
+      showPanelSelection();
+    }
+  } else {
+    showLoginScreen();
+  }
+});
