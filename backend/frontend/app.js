@@ -23,7 +23,6 @@ const customerAccounts = {
 let currentCustomer = null;   // Active logged-in customer ID (e.g. "CUST001")
 let selectedPanelId = null;   // Active selected panel ID (e.g. "PANEL001")
 let livePollingInterval = null;
-let latestRequestId = 0;
 
 // Telemetry & Chart State
 let telemetryChartInstance = null;
@@ -31,6 +30,24 @@ let activeChartTab = "telemetry";
 let chartHistoryData = [];
 let currentHistoricalRecords = [];
 let currentSelectedModalRecord = null;
+
+// Live Fault Banner - trip latch state.
+// The banner should only read "Fault Detected" right after a real TRIP
+// (Op Counter increments, OR the relay logs a new at-trip fault record),
+// not just because a current is momentarily above pickup (that's what
+// the ALARM/NORMAL pills are for). Once a trip is seen, the fault text
+// is latched on screen for TRIP_FAULT_DISPLAY_MS, then the banner falls
+// back to reflecting the live currents.
+//
+// Two independent trip signals are checked (either one latches the
+// banner): Op Counter incrementing, and the fault record's at-trip
+// timestamp changing. Using both means the banner still works correctly
+// even on a bench/test setup where Op Counter isn't reliably updating.
+const TRIP_FAULT_DISPLAY_MS = 10000;
+let lastSeenOpCounter = null;
+let lastSeenAtTripTime = null;
+let tripFaultBannerText = null;
+let tripFaultBannerUntil = 0;
 
 // --------------------------------------------------------------------------
 // HELPER FUNCTIONS FOR STRICT DATA EXTRACT & FORMATTING (NO FAKE DEFAULTS)
@@ -70,30 +87,6 @@ function formatValue(val, decimals = null, unit = '') {
     return num.toFixed(decimals) + (unit ? ` ${unit}` : '');
   }
   return String(num) + (unit ? ` ${unit}` : '');
-}
-
-function getRecordFaultStatus(rec) {
-  if (!rec) return "No Fault Detected";
-  const isOC = rec.overcurrent_fault === true || rec.overcurrent_fault === 1 || rec.overcurrent_fault === "true";
-  const isEF = rec.earth_fault === true || rec.earth_fault === 1 || rec.earth_fault === "true";
-
-  // STRICT SOURCE OF TRUTH: If both fault flags are false, status MUST be "No Fault Detected"
-  if (!isOC && !isEF) {
-    return "No Fault Detected";
-  }
-
-  // If record has backend calculated fault_status, use it
-  if (hasValue(rec.fault_status)) {
-    return rec.fault_status;
-  }
-
-  if (isOC && isEF) {
-    return "Fault Detected - E/F (Single Line Earth Fault Current)";
-  }
-  if (isEF) {
-    return "Fault Detected - E/F (Single Line Earth Fault Current)";
-  }
-  return "Fault Detected - O/C (Overcurrent Phase-to-Phase)";
 }
 
 // --------------------------------------------------------------------------
@@ -206,6 +199,10 @@ function selectPanel(panelId) {
 
   // Clear previous metrics & chart buffer
   chartHistoryData = [];
+  lastSeenOpCounter = null;
+  lastSeenAtTripTime = null;
+  tripFaultBannerText = null;
+  tripFaultBannerUntil = 0;
   clearDashboardMetrics();
   initTelemetryChart();
 
@@ -249,15 +246,10 @@ function stopLivePolling() {
 async function fetchLatestData() {
   if (!selectedPanelId) return;
 
-  const requestId = ++latestRequestId;
-
   const url = `${LATEST_ENDPOINT}?panel_id=${encodeURIComponent(selectedPanelId)}`;
 
   try {
     const response = await fetch(url);
-
-    // Ignore this response if a newer request has already started
-    if (requestId !== latestRequestId) return;
 
     if (!response.ok) {
       updateConnectionStatus(false, "Offline");
@@ -268,9 +260,7 @@ async function fetchLatestData() {
 
     const data = await response.json();
 
-    // Ignore stale response
-    if (requestId !== latestRequestId) return;
-
+    // Verify if response contains valid telemetry object
     if (!data || Object.keys(data).length === 0 || data.detail || data.message === "No Data Available") {
       updateConnectionStatus(true, "Online (No Data)");
       showNoDataAlert(selectedPanelId);
@@ -284,8 +274,6 @@ async function fetchLatestData() {
     processTelemetryData(data);
 
   } catch (error) {
-    if (requestId !== latestRequestId) return;
-
     console.error("API Polling Error:", error);
     updateConnectionStatus(false, "Disconnected");
     showNoDataAlert(selectedPanelId);
@@ -478,8 +466,51 @@ function processTelemetryData(data) {
   updatePill('pillI3', hasValue(i3Val) && Number(i3Val) > phasePickup);
   updatePill('pillI0', hasValue(i0Val) && Number(i0Val) > earthPickup);
 
-  // Live Fault Status Banner (from data.relay.live_fault_status ONLY)
-  const liveFaultStatus = relay.live_fault_status || "No Fault Detected";
+  // Live Fault Status Banner
+  // Only latch "Fault Detected" when the relay actually TRIPS - signaled
+  // by either the Op Counter incrementing, or the fault record logging a
+  // new at-trip event (its timestamp changing). A current sitting above
+  // pickup on its own is a pickup/alarm condition (already shown by the
+  // ALARM/NORMAL pills above), not a confirmed fault - the relay's own
+  // time-delay decides whether that pickup turns into a real trip. Once
+  // a trip is seen, show the fault text for TRIP_FAULT_DISPLAY_MS, then
+  // fall back to what the live currents actually say right now.
+  const opCounterVal = getRecordField(relay, ['op_counter']);
+  const opCounterNum = hasValue(opCounterVal) ? Number(opCounterVal) : null;
+  const atTripTimeVal = relay.fault_record1 ? relay.fault_record1.at_trip_time : undefined;
+
+  let tripDetected = false;
+
+  if (opCounterNum !== null && !isNaN(opCounterNum)) {
+    if (lastSeenOpCounter !== null && opCounterNum > lastSeenOpCounter) {
+      tripDetected = true;
+    }
+    lastSeenOpCounter = opCounterNum;
+  }
+
+  if (hasValue(atTripTimeVal)) {
+    if (lastSeenAtTripTime !== null && atTripTimeVal !== lastSeenAtTripTime) {
+      tripDetected = true;
+    }
+    lastSeenAtTripTime = atTripTimeVal;
+  }
+
+  if (tripDetected) {
+    tripFaultBannerText = relay.live_fault_status || "Fault Detected";
+    tripFaultBannerUntil = Date.now() + TRIP_FAULT_DISPLAY_MS;
+  }
+
+  let liveFaultStatus;
+  if (Date.now() < tripFaultBannerUntil) {
+    // Still inside the post-trip display window.
+    liveFaultStatus = tripFaultBannerText || "Fault Detected";
+  } else {
+    // No recent trip - a current sitting above pickup on its own is not
+    // a confirmed fault (that's what the ALARM/NORMAL pills are for), so
+    // the banner reads Normal until the next real trip.
+    liveFaultStatus = "No Fault Detected";
+  }
+
   const faultBanner = document.getElementById('faultSummaryBanner');
   const faultIcon = document.getElementById('faultIcon');
   const faultText = document.getElementById('faultSummaryText');
@@ -760,32 +791,46 @@ function renderHistoricalTable(records) {
     const tr = document.createElement('tr');
     
     const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at', 'event_timestamp']));
-    const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+    const panelId = formatValue(getRecordField(rec, ['panel_id']), null) !== '--' ? getRecordField(rec, ['panel_id']) : selectedPanelId;
 
-    // TIME-SPECIFIC FAULT STATUS FOR THIS PARTICULAR DATABASE RECORD ONLY
-    const faultStatus = getRecordFaultStatus(rec);
+// Fault status for THIS database row only.
+// Do NOT use historical_fault_status here because that can
+// represent the previous/last trip and may remain populated
+// even after the system returns to normal.
 
-    const isFaulted = faultStatus !== 'No Fault Detected' && !faultStatus.toLowerCase().includes('normal');
-    const badgeClass = isFaulted ? 'fault-badge fault-bad' : 'fault-badge fault-ok';
+const overcurrentFault = rec.overcurrent_fault === true;
+const earthFault = rec.earth_fault === true;
 
-    // Currents strictly belonging to THIS particular database record
-    let i1Val = getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']);
-    let i2Val = getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']);
-    let i3Val = getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']);
-    let i0Val = getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']);
+const isFaulted = overcurrentFault || earthFault;
 
-    // Display At-Trip currents ONLY for a genuine fault record where At-Trip data is present
-    if (isFaulted && hasValue(getRecordField(rec, ['fr_attrip_i1']))) {
-      i1Val = getRecordField(rec, ['fr_attrip_i1']);
-      i2Val = getRecordField(rec, ['fr_attrip_i2']);
-      i3Val = getRecordField(rec, ['fr_attrip_i3']);
-      i0Val = getRecordField(rec, ['fr_attrip_i0']);
-    }
+let faultStatus;
 
-    // Voltages strictly belonging to THIS particular database record
-    const vrVal = getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']);
-    const vyVal = getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']);
-    const vbVal = getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']);
+if (earthFault) {
+  faultStatus = 'Fault Detected - Earth Fault (E/F)';
+} else if (overcurrentFault) {
+  faultStatus = 'Fault Detected - Overcurrent (O/C)';
+} else {
+  faultStatus = 'No Fault Detected';
+}
+
+const badgeClass = isFaulted
+  ? 'fault-badge fault-bad'
+  : 'fault-badge fault-ok';
+
+
+    // Historical Records must ALWAYS display the actual
+// relay current values stored for THIS database record.
+// Do NOT replace them with At-Trip fault-record values.
+
+      const i1Val = getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']);
+      const i2Val = getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']);
+      const i3Val = getRecordField(rec, ['relay_i3', 'i3', 'relay.i3']);
+      const i0Val = getRecordField(rec, ['relay_i0', 'i0', 'relay.i0']);
+
+    // Voltages for this specific historical record
+    let vrVal = getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']);
+    let vyVal = getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']);
+    let vbVal = getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']);
 
     tr.innerHTML = `
       <td>${timestamp}</td>
@@ -837,11 +882,11 @@ function openDetailsModal(index) {
 
   const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
   const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
 
-  // Determine fault status FOR THIS HISTORICAL RECORD ONLY
-  const faultStatus = getRecordFaultStatus(rec);
-
-  // Relay data for THIS record
+  // Relay data
   const sg = formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active']));
   const phasePickup = formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase']), null, 'A');
   const earthPickup = formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth']), null, 'A');
@@ -855,7 +900,7 @@ function openDetailsModal(index) {
   const thermalLevel = formatValue(getRecordField(rec, ['thermal_level', 'relay.thermal_level']), 1, '%');
   const relayRtc = formatValue(getRecordField(rec, ['relay_rtc', 'rtc', 'relay.rtc']));
 
-  // Meter data for THIS record
+  // Meter data
   const vr = formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1, 'V');
   const vy = formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1, 'V');
   const vb = formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1, 'V');
@@ -863,12 +908,12 @@ function openDetailsModal(index) {
   const pfTotal = formatValue(getRecordField(rec, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2);
   const freq = formatValue(getRecordField(rec, ['meter_frequency', 'frequency', 'meter.frequency']), 2, 'Hz');
 
-  // DHT22 data for THIS record
+  // DHT22 data
   const temp = formatValue(getRecordField(rec, ['temperature', 'dht.temperature']), 1, '°C');
   const hum = formatValue(getRecordField(rec, ['humidity', 'dht.humidity']), 1, '%');
 
-  // ONLY render Associated Fault Event Record IF THIS SPECIFIC RECORD WAS AN ACTUAL FAULT
-  const isTripRecord = faultStatus !== 'No Fault Detected' && !faultStatus.toLowerCase().includes('normal');
+  // Fault Record Details (ONLY if present on this specific historical record)
+  const isTripRecord = faultStatus !== 'No Fault Detected' || hasValue(getRecordField(rec, ['fr_attrip_timestamp']));
   let faultDetailsHtml = '';
 
   if (isTripRecord) {
@@ -981,8 +1026,9 @@ function exportSingleRecordPdf() {
 
   const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
   const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
-
-  const faultStatus = getRecordFaultStatus(rec);
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
 
   doc.setFontSize(14);
   doc.text(`MV Substation Telemetry Record Snapshot`, 14, 15);
@@ -1035,8 +1081,9 @@ function exportSingleRecordExcel() {
   const rec = currentSelectedModalRecord;
   const timestamp = formatValue(getRecordField(rec, ['timestamp', 'created_at']));
   const panelId = hasValue(getRecordField(rec, ['panel_id'])) ? getRecordField(rec, ['panel_id']) : selectedPanelId;
-
-  const faultStatus = getRecordFaultStatus(rec);
+  const faultStatus = hasValue(getRecordField(rec, ['fault_status', 'historical_fault_status']))
+    ? getRecordField(rec, ['fault_status', 'historical_fault_status'])
+    : 'No Fault Detected';
 
   const exportData = [{
     "Timestamp": timestamp,
@@ -1086,27 +1133,25 @@ function exportHistoricalExcel() {
     return;
   }
 
-  const exportData = currentHistoricalRecords.map(r => {
-    const faultStatus = getRecordFaultStatus(r);
-
-    return {
-      "Timestamp": formatValue(getRecordField(r, ['timestamp', 'created_at'])),
-      "Customer ID": currentCustomer || "--",
-      "Panel ID": hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
-      "Fault Status": faultStatus,
-      "I1 Current (A)": formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
-      "I2 Current (A)": formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
-      "I3 Current (A)": formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
-      "I0 Earth (A)": formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
-      "VR Voltage (V)": formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
-      "VY Voltage (V)": formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
-      "VB Voltage (V)": formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1),
-      "Total Power (kW)": formatValue(getRecordField(r, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2),
-      "Power Factor": formatValue(getRecordField(r, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2),
-      "Temperature (°C)": formatValue(getRecordField(r, ['temperature', 'dht.temperature']), 1),
-      "Humidity (%)": formatValue(getRecordField(r, ['humidity', 'dht.humidity']), 1)
-    };
-  });
+  const exportData = currentHistoricalRecords.map(r => ({
+    "Timestamp": formatValue(getRecordField(r, ['timestamp', 'created_at'])),
+    "Customer ID": currentCustomer || "--",
+    "Panel ID": hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
+    "Fault Status": hasValue(getRecordField(r, ['fault_status', 'historical_fault_status']))
+      ? getRecordField(r, ['fault_status', 'historical_fault_status'])
+      : 'No Fault Detected',
+    "I1 Current (A)": formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
+    "I2 Current (A)": formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
+    "I3 Current (A)": formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
+    "I0 Earth (A)": formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
+    "VR Voltage (V)": formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
+    "VY Voltage (V)": formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
+    "VB Voltage (V)": formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1),
+    "Total Power (kW)": formatValue(getRecordField(r, ['meter_p_t', 'total_power_p_t', 'p_t', 'meter.p_t']), 2),
+    "Power Factor": formatValue(getRecordField(r, ['meter_pf_t', 'total_power_factor', 'pf_t', 'meter.pf_t']), 2),
+    "Temperature (°C)": formatValue(getRecordField(r, ['temperature', 'dht.temperature']), 1),
+    "Humidity (%)": formatValue(getRecordField(r, ['humidity', 'dht.humidity']), 1)
+  }));
 
   const worksheet = XLSX.utils.json_to_sheet(exportData);
   const workbook = XLSX.utils.book_new();
@@ -1130,22 +1175,20 @@ function exportHistoricalPdf() {
   doc.text(`Customer: ${currentCustomer} | Export Date: ${new Date().toLocaleString()}`, 14, 22);
 
   const tableColumn = ["Timestamp", "Panel", "Fault Status", "I1(A)", "I2(A)", "I3(A)", "I0(A)", "VR(V)", "VY(V)", "VB(V)"];
-  const tableRows = currentHistoricalRecords.map(r => {
-    const faultStatus = getRecordFaultStatus(r);
-
-    return [
-      formatValue(getRecordField(r, ['timestamp', 'created_at'])),
-      hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
-      faultStatus,
-      formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
-      formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
-      formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
-      formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
-      formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
-      formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
-      formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1)
-    ];
-  });
+  const tableRows = currentHistoricalRecords.map(r => [
+    formatValue(getRecordField(r, ['timestamp', 'created_at'])),
+    hasValue(getRecordField(r, ['panel_id'])) ? getRecordField(r, ['panel_id']) : selectedPanelId,
+    hasValue(getRecordField(r, ['fault_status', 'historical_fault_status']))
+      ? getRecordField(r, ['fault_status', 'historical_fault_status'])
+      : 'No Fault Detected',
+    formatValue(getRecordField(r, ['relay_i1', 'i1', 'relay.i1']), 2),
+    formatValue(getRecordField(r, ['relay_i2', 'i2', 'relay.i2']), 2),
+    formatValue(getRecordField(r, ['relay_i3', 'i3', 'relay.i3']), 2),
+    formatValue(getRecordField(r, ['relay_i0', 'i0', 'relay.i0']), 2),
+    formatValue(getRecordField(r, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
+    formatValue(getRecordField(r, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
+    formatValue(getRecordField(r, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1)
+  ]);
 
   doc.autoTable({
     head: [tableColumn],
