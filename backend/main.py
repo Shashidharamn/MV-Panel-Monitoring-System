@@ -599,16 +599,19 @@ OVERCURRENT_EVENT_TYPES: set = set()
 
 
 def derive_fault_status(overcurrent_fault, earth_fault, event_type=None, event_subtype=None) -> str:
-    if overcurrent_fault and earth_fault:
+    oc = bool(overcurrent_fault)
+    ef = bool(earth_fault)
+
+    if oc and ef:
         if event_type in EARTH_FAULT_EVENT_TYPES or event_subtype in EARTH_FAULT_EVENT_TYPES:
             return "Fault Detected - E/F (Single Line Earth Fault Current)"
         if event_type in OVERCURRENT_EVENT_TYPES or event_subtype in OVERCURRENT_EVENT_TYPES:
             return "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
         return "Fault Detected - E/F (Single Line Earth Fault Current)"
 
-    if earth_fault:
+    if ef:
         return "Fault Detected - E/F (Single Line Earth Fault Current)"
-    if overcurrent_fault:
+    if oc:
         return "Fault Detected - O/C (Overcurrent Phase-to-Phase)"
     return "No Fault Detected"
 
@@ -650,6 +653,7 @@ def latest_data(panel_id: Optional[str] = Query(None)):
 
     flat = row_to_dict(row, timestamp_as_string=False)
 
+    # Derive LIVE fault status strictly from latest DB record's overcurrent_fault & earth_fault flags
     fault_status_text = derive_fault_status(
         flat["overcurrent_fault"],
         flat["earth_fault"],
@@ -841,16 +845,15 @@ def get_history(
     for row in rows:
         rec = row_to_dict(row, timestamp_as_string=True)
 
-        # PRESERVE THE STORED HISTORICAL FAULT STATUS FROM POSTGRESQL DB RECORD
-        stored_status = rec.get("historical_fault_status") or rec.get("fault_status")
-        if not stored_status or not str(stored_status).strip():
-            stored_status = derive_fault_status(
-                rec["overcurrent_fault"],
-                rec["earth_fault"],
-                rec["event_type"],
-                rec["event_subtype"],
-            )
-        rec["fault_status"] = stored_status
+        # STRICT PER-ROW HISTORICAL FAULT STATUS:
+        # Calculate status directly from THAT ROW's overcurrent_fault & earth_fault flags.
+        # Do NOT use stored text fields or copy previous status into later rows.
+        rec["fault_status"] = derive_fault_status(
+            rec["overcurrent_fault"],
+            rec["earth_fault"],
+            rec.get("event_type"),
+            rec.get("event_subtype"),
+        )
 
         history.append(rec)
 
