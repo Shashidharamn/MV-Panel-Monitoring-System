@@ -6,7 +6,7 @@
 // 1. CONFIGURATION & STATE MANAGEMENT
 // --------------------------------------------------------------------------
 
-const API_BASE_URL = "https://mv-panel-monitoring-system-qobz.onrender.com";
+const API_BASE_URL = "https://mv-panel-monitoring-system.onrender.com";
 const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
 const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
 
@@ -913,7 +913,7 @@ function openDetailsModal(index) {
   const hum = formatValue(getRecordField(rec, ['humidity', 'dht.humidity']), 1, '%');
 
   // Fault Record Details (ONLY if present on this specific historical record)
-  const isTripRecord = faultStatus !== 'No Fault Detected' || hasValue(getRecordField(rec, ['fr_attrip_timestamp']));
+  const isTripRecord = faultStatus !== 'No Fault Detected';
   let faultDetailsHtml = '';
 
   if (isTripRecord) {
