@@ -682,9 +682,9 @@ def latest_data(panel_id: Optional[str] = Query(None)):
             "i2": flat["relay_i2"],
             "i3": flat["relay_i3"],
             "i0": flat["relay_i0"],
-            "op_counter": flat["operation_counter"],
             "neg_seq": flat["negative_sequence_current"],
             "thermal_level": flat["thermal_level"],
+            "ied_status": flat["current_relay_status"],
             "rtc": flat["relay_rtc"],
             "live_fault_status": fault_status_text,
             "event": {

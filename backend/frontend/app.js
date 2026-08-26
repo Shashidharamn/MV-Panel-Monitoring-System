@@ -6,7 +6,7 @@
 // 1. CONFIGURATION & STATE MANAGEMENT
 // --------------------------------------------------------------------------
 
-const API_BASE_URL = "https://mv-panel-monitoring-system.onrender.com";
+const API_BASE_URL = "https://mv-panel-monitoring-system-qobz.onrender.com";
 const LATEST_ENDPOINT = `${API_BASE_URL}/latest`;
 const HISTORY_ENDPOINT = `${API_BASE_URL}/history`;
 
@@ -32,19 +32,9 @@ let currentHistoricalRecords = [];
 let currentSelectedModalRecord = null;
 
 // Live Fault Banner - trip latch state.
-// The banner should only read "Fault Detected" right after a real TRIP
-// (Op Counter increments, OR the relay logs a new at-trip fault record),
-// not just because a current is momentarily above pickup (that's what
-// the ALARM/NORMAL pills are for). Once a trip is seen, the fault text
-// is latched on screen for TRIP_FAULT_DISPLAY_MS, then the banner falls
-// back to reflecting the live currents.
-//
-// Two independent trip signals are checked (either one latches the
-// banner): Op Counter incrementing, and the fault record's at-trip
-// timestamp changing. Using both means the banner still works correctly
-// even on a bench/test setup where Op Counter isn't reliably updating.
+// The operation counter is not used by the dashboard. A new stored
+// At-Trip timestamp is used as the trip-change signal instead.
 const TRIP_FAULT_DISPLAY_MS = 10000;
-let lastSeenOpCounter = null;
 let lastSeenAtTripTime = null;
 let tripFaultBannerText = null;
 let tripFaultBannerUntil = 0;
@@ -341,7 +331,7 @@ function clearDashboardMetrics() {
   setText('relaySG', 'SG1');
   setText('relayIPhasePickup', '-- A');
   setText('relayIEarthPickup', '-- A');
-  setText('relayOpCounter', '--');
+  setText('relayIedStatus', '--');
   setText('relayI1', '--');
   setText('relayI2', '--');
   setText('relayI3', '--');
@@ -437,7 +427,8 @@ function processTelemetryData(data) {
 
   setText('relayIPhasePickup', formatValue(phasePickupVal, null, 'A'));
   setText('relayIEarthPickup', formatValue(earthPickupVal, null, 'A'));
-  setText('relayOpCounter', formatValue(getRecordField(relay, ['op_counter'])));
+  // IED status comes directly from the FastAPI/PostgreSQL record.
+  setText('relayIedStatus', formatValue(getRecordField(relay, ['ied_status', 'current_relay_status', 'relay_status'])));
 
   const i1Val = getRecordField(relay, ['i1']);
   const i2Val = getRecordField(relay, ['i2']);
@@ -467,26 +458,11 @@ function processTelemetryData(data) {
   updatePill('pillI0', hasValue(i0Val) && Number(i0Val) > earthPickup);
 
   // Live Fault Status Banner
-  // Only latch "Fault Detected" when the relay actually TRIPS - signaled
-  // by either the Op Counter incrementing, or the fault record logging a
-  // new at-trip event (its timestamp changing). A current sitting above
-  // pickup on its own is a pickup/alarm condition (already shown by the
-  // ALARM/NORMAL pills above), not a confirmed fault - the relay's own
-  // time-delay decides whether that pickup turns into a real trip. Once
-  // a trip is seen, show the fault text for TRIP_FAULT_DISPLAY_MS, then
-  // fall back to what the live currents actually say right now.
-  const opCounterVal = getRecordField(relay, ['op_counter']);
-  const opCounterNum = hasValue(opCounterVal) ? Number(opCounterVal) : null;
+  // The operation counter is intentionally NOT used. A new stored
+  // At-Trip timestamp is enough to detect a newly stored trip record.
   const atTripTimeVal = relay.fault_record1 ? relay.fault_record1.at_trip_time : undefined;
 
   let tripDetected = false;
-
-  if (opCounterNum !== null && !isNaN(opCounterNum)) {
-    if (lastSeenOpCounter !== null && opCounterNum > lastSeenOpCounter) {
-      tripDetected = true;
-    }
-    lastSeenOpCounter = opCounterNum;
-  }
 
   if (hasValue(atTripTimeVal)) {
     if (lastSeenAtTripTime !== null && atTripTimeVal !== lastSeenAtTripTime) {
@@ -890,7 +866,6 @@ function openDetailsModal(index) {
   const sg = formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active']));
   const phasePickup = formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase']), null, 'A');
   const earthPickup = formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth']), null, 'A');
-  const opCounter = formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter']));
 
   const i1 = formatValue(getRecordField(rec, ['relay_i1', 'i1', 'relay.i1']), 2, 'A');
   const i2 = formatValue(getRecordField(rec, ['relay_i2', 'i2', 'relay.i2']), 2, 'A');
@@ -978,7 +953,7 @@ function openDetailsModal(index) {
         <div class="detail-field"><span class="detail-field-label">Setting Group</span><span class="detail-field-value">${sg}</span></div>
         <div class="detail-field"><span class="detail-field-label">Phase Pickup</span><span class="detail-field-value">${phasePickup}</span></div>
         <div class="detail-field"><span class="detail-field-label">Earth Pickup</span><span class="detail-field-value">${earthPickup}</span></div>
-        <div class="detail-field"><span class="detail-field-label">Op Counter</span><span class="detail-field-value">${opCounter}</span></div>
+        <div class="detail-field"><span class="detail-field-label">IED Status</span><span class="detail-field-value">${formatValue(getRecordField(rec, ['current_relay_status', 'ied_status', 'relay_status']))}</span></div>
         <div class="detail-field"><span class="detail-field-label">Phase I1</span><span class="detail-field-value">${i1}</span></div>
         <div class="detail-field"><span class="detail-field-label">Phase I2</span><span class="detail-field-value">${i2}</span></div>
         <div class="detail-field"><span class="detail-field-label">Phase I3</span><span class="detail-field-value">${i3}</span></div>
@@ -1050,7 +1025,6 @@ function exportSingleRecordPdf() {
     ["Setting Group", formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active']))],
     ["Phase Pickup", formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase']), null, 'A')],
     ["Earth Pickup", formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth']), null, 'A')],
-    ["Op Counter", formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter']))],
     ["V_R Voltage", formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1, 'V')],
     ["V_Y Voltage", formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1, 'V')],
     ["V_B Voltage", formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1, 'V')],
@@ -1099,7 +1073,7 @@ function exportSingleRecordExcel() {
     "Active SG": formatValue(getRecordField(rec, ['setting_group', 'sg_active', 'relay.sg_active'])),
     "Phase Pickup (A)": formatValue(getRecordField(rec, ['pickup_phase', 'i_phase_pickup', 'relay.pickup_phase'])),
     "Earth Pickup (A)": formatValue(getRecordField(rec, ['pickup_earth', 'i_earth_pickup', 'relay.pickup_earth'])),
-    "Op Counter": formatValue(getRecordField(rec, ['operation_counter', 'op_counter', 'relay.op_counter'])),
+    "IED Status": formatValue(getRecordField(rec, ['current_relay_status', 'ied_status', 'relay_status'])),
     "V_R (V)": formatValue(getRecordField(rec, ['meter_v_r', 'vr', 'v_r', 'meter.v_r']), 1),
     "V_Y (V)": formatValue(getRecordField(rec, ['meter_v_y', 'vy', 'v_y', 'meter.v_y']), 1),
     "V_B (V)": formatValue(getRecordField(rec, ['meter_v_b', 'vb', 'v_b', 'meter.v_b']), 1),
