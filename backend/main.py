@@ -87,21 +87,34 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
 
 
 def is_active_fault(status: Optional[str]) -> bool:
-    status = str(status or "").strip().lower()
+    """
+    Treat the IED relay status as the fault trigger.
 
-    return (
-        "phase trip" in status
-        or "earth trip" in status
-        or "internal relay fault" in status
-    )
+    Examples that should trigger SMS:
+    - Unit Ready - Phase Trip
+    - Unit Ready - Earth Trip
+    - Phase Trip
+    - Earth Trip
+
+    Normal status:
+    - Unit Ready
+    - No Fault Detected
+    """
+    text = str(status or "").strip().lower()
+
+    if not text:
+        return False
+
+    # Any Trip status from the IED is considered a fault.
+    return "trip" in text
 
 
 def send_fault_alert_if_needed(data: "SensorData") -> None:
-    """Send one SMS when the IED enters a fault state."""
+    """Send one SMS when the IED status changes into a Trip state."""
 
     panel_id = data.panel_id
 
-    # Use IED status ONLY for SMS triggering
+    # Use ONLY the IED/current relay status for triggering SMS.
     ied_status = (
         data.current_relay_status
         or data.ied_status
@@ -109,12 +122,15 @@ def send_fault_alert_if_needed(data: "SensorData") -> None:
     ).strip()
 
     active = is_active_fault(ied_status)
+
+    # Previous state of this panel.
     previous = _last_fault_state.get(panel_id, False)
 
-    # Remember current state to prevent repeated SMS
+    # Save current state so the same fault does not send
+    # an SMS on every ESP32 reading.
     _last_fault_state[panel_id] = active
 
-    # No fault, or fault already notified
+    # No trip, or this trip was already active.
     if not active or previous:
         return
 
@@ -127,11 +143,13 @@ def send_fault_alert_if_needed(data: "SensorData") -> None:
         f"I0={data.relay_i0:.2f}A"
     )
 
+    # Send the SMS.
+    result = send_twilio_sms(message)
 
-    
-    # SMS failure must never stop sensor data from being stored.
-    send_twilio_sms(message)
-
+    # Print the result so Render Logs clearly show
+    # whether Twilio accepted or rejected the SMS.
+    print(f"[SMS ALERT] IED Status: {ied_status}")
+    print(f"[SMS ALERT] Twilio result: {result}")
 
 app = FastAPI()
 
