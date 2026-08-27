@@ -8,6 +8,7 @@ import os
 import base64
 import urllib.parse
 import urllib.request
+import urllib.error
 from db import get_connection
 
 
@@ -64,8 +65,25 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
         with urllib.request.urlopen(request, timeout=15) as response:
             result = response.read().decode("utf-8")
         return {"success": True, "response": result}
+    
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "success": False,
+            "message": f"Twilio HTTP {exc.code}: {error_body}"
+        }
+
+    except urllib.error.URLError as exc:
+        return {
+            "success": False,
+            "message": f"Twilio connection error: {exc.reason}"
+        }
+
     except Exception as exc:
-        return {"success": False, "message": str(exc)}
+        return {
+            "success": False,
+            "message": f"Twilio unexpected error: {exc}"
+        }
 
 
 def is_active_fault(status: Optional[str]) -> bool:
