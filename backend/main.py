@@ -22,6 +22,14 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
 TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")
 
+# Print (masked) config once at startup so Render logs confirm which
+# Twilio values this deployment is actually using.
+print(
+    f"[TWILIO CONFIG] sid_set={bool(TWILIO_ACCOUNT_SID)} "
+    f"token_set={bool(TWILIO_AUTH_TOKEN)} "
+    f"from={TWILIO_FROM_NUMBER!r} to={TWILIO_TO_NUMBER!r}"
+)
+
 # Prevent an SMS from being sent on every ESP32 reading.
 # An alert is sent only when a panel changes from normal -> fault.
 _last_fault_state = {}
@@ -65,7 +73,7 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
         with urllib.request.urlopen(request, timeout=15) as response:
             result = response.read().decode("utf-8")
         return {"success": True, "response": result}
-    
+
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         return {
@@ -88,30 +96,33 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
 
 def is_active_fault(status: Optional[str]) -> bool:
     """
-    Determine whether the IED is currently in a trip/fault state.
+    Treat the IED relay status as the fault trigger.
 
-    SMS should be triggered from the IED status, not from the
-    instantaneous current values, because current can return to
-    zero after the relay trips.
+    Examples that should trigger SMS:
+    - Unit Ready - Phase Trip
+    - Unit Ready - Earth Trip
+    - Phase Trip
+    - Earth Trip
+
+    Normal status:
+    - Unit Ready
+    - No Fault Detected
     """
     text = str(status or "").strip().lower()
 
-    return (
-        "phase trip" in text
-        or "earth trip" in text
-        or "internal relay fault" in text
-    )
+    if not text:
+        return False
+
+    # Any Trip status from the IED is considered a fault.
+    return "trip" in text
 
 
 def send_fault_alert_if_needed(data: "SensorData") -> None:
-    """
-    Send one SMS when the IED changes from normal to a trip state.
-    """
+    """Send one SMS when the IED status changes into a Trip state."""
 
     panel_id = data.panel_id
 
-    # IMPORTANT:
-    # Use the actual IED/relay status sent by the ESP32.
+    # Use ONLY the IED/current relay status for triggering SMS.
     ied_status = (
         data.current_relay_status
         or data.ied_status
@@ -123,11 +134,21 @@ def send_fault_alert_if_needed(data: "SensorData") -> None:
     # Previous state of this panel.
     previous = _last_fault_state.get(panel_id, False)
 
-    # Store current state so we don't send an SMS every time
-    # the ESP32 sends its next reading.
+    # Save current state so the same fault does not send
+    # an SMS on every ESP32 reading.
     _last_fault_state[panel_id] = active
 
-    # Nothing to alert, or this fault was already alerted.
+    # Always log the check result, not just when it triggers an SMS.
+    # This is the key diagnostic: it tells you in Render logs exactly
+    # what status string was received and why an SMS did/didn't fire,
+    # instead of guessing from silence in the logs.
+    print(
+        f"[FAULT CHECK] panel={panel_id} ied_status='{ied_status}' "
+        f"active={active} previous={previous} "
+        f"will_send={active and not previous}"
+    )
+
+    # No trip, or this trip was already active.
     if not active or previous:
         return
 
@@ -140,11 +161,11 @@ def send_fault_alert_if_needed(data: "SensorData") -> None:
         f"I0={data.relay_i0:.2f}A"
     )
 
-    # Send SMS and print the result so Render Logs tell us
-    # exactly whether Twilio accepted or rejected it.
+    # Send the SMS.
     result = send_twilio_sms(message)
 
-    print(f"[SMS ALERT] Panel: {panel_id}")
+    # Print the result so Render Logs clearly show
+    # whether Twilio accepted or rejected the SMS.
     print(f"[SMS ALERT] IED Status: {ied_status}")
     print(f"[SMS ALERT] Twilio result: {result}")
 
