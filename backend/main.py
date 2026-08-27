@@ -18,8 +18,8 @@ from db import get_connection
 # -----------------------------
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.getenv("+17372212163")
-TWILIO_TO_NUMBER = os.getenv("+918867238293")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")
 
 # Prevent an SMS from being sent on every ESP32 reading.
 # An alert is sent only when a panel changes from normal -> fault.
