@@ -14,35 +14,88 @@ from db import get_connection
 
 # -----------------------------
 # Twilio SMS configuration
-# Keep these values in Render Environment Variables.
-# Do NOT hard-code the Auth Token in this file.
 # -----------------------------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
-TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER")
+# Configure these in Render -> Environment Variables.
+#
+# TWILIO_ACCOUNT_SID   = ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# TWILIO_AUTH_TOKEN    = your_auth_token
+# TWILIO_FROM_NUMBER   = +1xxxxxxxxxx   (Twilio SMS-capable number)
+# TWILIO_TO_NUMBER     = +91xxxxxxxxxx (your mobile number)
+#
+# IMPORTANT:
+# - Use E.164 format for phone numbers, e.g. +919876543210.
+# - For a Twilio Trial account, the destination number normally must
+#   be verified in Twilio before SMS can be delivered.
+# - Do NOT hard-code the Auth Token in this file.
 
-# Prevent an SMS from being sent on every ESP32 reading.
-# An alert is sent only when a panel changes from normal -> fault.
-_last_fault_state = {}
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
+TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER", "").strip()
+
+# Alert thresholds. These match the ESP32 DHT22 thresholds in your code.
+HIGH_TEMP = float(os.getenv("HIGH_TEMP", "40.0"))
+HIGH_HUM = float(os.getenv("HIGH_HUM", "80.0"))
+
+# State is kept separately for each panel and each alert type.
+# This prevents an SMS from being sent on every ESP32 reading.
+#
+# Example:
+# _alert_state["PANEL-01"] = {
+#     "relay_fault": False,
+#     "overcurrent": False,
+#     "earth_fault": False,
+#     "high_temperature": False,
+#     "high_humidity": False,
+# }
+_alert_state = {}
+
+
+def _normalise_phone_number(number: Optional[str]) -> str:
+    """Return a trimmed phone number; Twilio expects E.164 format."""
+    return str(number or "").strip()
 
 
 def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
-    """Send one SMS through Twilio's REST API."""
+    """Send one SMS through Twilio's REST API and return useful diagnostics."""
     sid = TWILIO_ACCOUNT_SID
     token = TWILIO_AUTH_TOKEN
-    from_number = TWILIO_FROM_NUMBER
-    to_number = to_number or TWILIO_TO_NUMBER
+    from_number = _normalise_phone_number(TWILIO_FROM_NUMBER)
+    destination = _normalise_phone_number(to_number or TWILIO_TO_NUMBER)
 
-    if not all([sid, token, from_number, to_number]):
+    missing = []
+    if not sid:
+        missing.append("TWILIO_ACCOUNT_SID")
+    if not token:
+        missing.append("TWILIO_AUTH_TOKEN")
+    if not from_number:
+        missing.append("TWILIO_FROM_NUMBER")
+    if not destination:
+        missing.append("TWILIO_TO_NUMBER")
+
+    if missing:
         return {
             "success": False,
-            "message": "Twilio environment variables are not configured."
+            "message": "Missing Twilio environment variable(s): " + ", ".join(missing)
         }
 
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    # Twilio phone numbers should be in international E.164 format.
+    if not from_number.startswith("+") or not destination.startswith("+"):
+        return {
+            "success": False,
+            "message": (
+                "Twilio phone numbers must use E.164 format, "
+                "for example +919876543210."
+            )
+        }
+
+    url = (
+        f"https://api.twilio.com/2010-04-01/"
+        f"Accounts/{urllib.parse.quote(sid, safe='')}/Messages.json"
+    )
+
     payload = urllib.parse.urlencode({
-        "To": to_number,
+        "To": destination,
         "From": from_number,
         "Body": body,
     }).encode("utf-8")
@@ -58,98 +111,238 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
         headers={
             "Authorization": f"Basic {credentials}",
             "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "NIEL-MV-Panel-Monitoring/1.0",
         },
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            result = response.read().decode("utf-8")
-        return {"success": True, "response": result}
-    
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+
+        return {
+            "success": True,
+            "message": "Twilio accepted the SMS request.",
+            "response": response_body,
+        }
+
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         return {
             "success": False,
-            "message": f"Twilio HTTP {exc.code}: {error_body}"
+            "message": f"Twilio HTTP {exc.code}: {error_body}",
         }
 
     except urllib.error.URLError as exc:
         return {
             "success": False,
-            "message": f"Twilio connection error: {exc.reason}"
+            "message": f"Twilio connection error: {exc.reason}",
         }
 
     except Exception as exc:
         return {
             "success": False,
-            "message": f"Twilio unexpected error: {exc}"
+            "message": f"Twilio unexpected error: {exc}",
         }
 
 
-def is_active_fault(status: Optional[str]) -> bool:
+def _get_panel_alert_state(panel_id: str) -> dict:
+    """Create/get independent alert-state flags for one panel."""
+    if panel_id not in _alert_state:
+        _alert_state[panel_id] = {
+            "relay_fault": False,
+            "overcurrent": False,
+            "earth_fault": False,
+            "high_temperature": False,
+            "high_humidity": False,
+        }
+    return _alert_state[panel_id]
+
+
+def _send_alert_on_rising_edge(
+    panel_id: str,
+    alert_key: str,
+    condition: bool,
+    message: str,
+) -> None:
     """
-    Treat the IED relay status as the fault trigger.
+    Send one SMS only when an alert changes:
+        False -> True
 
-    Examples that should trigger SMS:
-    - Unit Ready - Phase Trip
-    - Unit Ready - Earth Trip
-    - Phase Trip
-    - Earth Trip
-
-    Normal status:
-    - Unit Ready
-    - No Fault Detected
+    When the condition becomes False, the flag is reset. A future
+    False -> True transition will therefore generate a new SMS.
     """
-    text = str(status or "").strip().lower()
+    state = _get_panel_alert_state(panel_id)
+    previous = bool(state.get(alert_key, False))
 
-    if not text:
-        return False
+    # Always update the state, even if SMS configuration is broken.
+    # This avoids an SMS flood on every ESP32 POST.
+    state[alert_key] = bool(condition)
 
-    # Any Trip status from the IED is considered a fault.
-    return "trip" in text
+    if not condition or previous:
+        return
+
+    result = send_twilio_sms(message)
+
+    print(f"[SMS ALERT] panel={panel_id} type={alert_key}")
+    print(f"[SMS ALERT] result={result}")
 
 
-def send_fault_alert_if_needed(data: "SensorData") -> None:
-    """Send one SMS when the IED status changes into a Trip state."""
+def send_alerts_if_needed(data: "SensorData") -> None:
+    """
+    Check all required alert sources:
+      1. Relay / IED trip
+      2. Overcurrent
+      3. Earth fault
+      4. High temperature
+      5. High humidity
 
-    panel_id = data.panel_id
+    Each alert has its own rising-edge state, so one active condition
+    does not generate repeated SMS messages every 3 seconds.
+    """
+    panel_id = str(data.panel_id).strip() or "UNKNOWN"
 
-    # Use ONLY the IED/current relay status for triggering SMS.
+    i1 = float(data.relay_i1)
+    i2 = float(data.relay_i2)
+    i3 = float(data.relay_i3)
+    i0 = float(data.relay_i0)
+
+    # -----------------------------
+    # 1. Relay / IED trip
+    # -----------------------------
     ied_status = (
         data.current_relay_status
         or data.ied_status
         or ""
     ).strip()
 
-    active = is_active_fault(ied_status)
+    relay_trip = "trip" in ied_status.lower()
 
-    # Previous state of this panel.
-    previous = _last_fault_state.get(panel_id, False)
-
-    # Save current state so the same fault does not send
-    # an SMS on every ESP32 reading.
-    _last_fault_state[panel_id] = active
-
-    # No trip, or this trip was already active.
-    if not active or previous:
-        return
-
-    message = (
+    relay_message = (
         f"MV PANEL ALERT - {panel_id}\n"
-        f"IED Status: {ied_status}\n"
-        f"I1={data.relay_i1:.2f}A "
-        f"I2={data.relay_i2:.2f}A "
-        f"I3={data.relay_i3:.2f}A "
-        f"I0={data.relay_i0:.2f}A"
+        f"Relay Trip Detected\n"
+        f"IED Status: {ied_status or 'Trip'}\n"
+        f"I1={i1:.2f}A I2={i2:.2f}A\n"
+        f"I3={i3:.2f}A I0={i0:.2f}A"
     )
 
-    # Send the SMS.
-    result = send_twilio_sms(message)
+    _send_alert_on_rising_edge(
+        panel_id,
+        "relay_fault",
+        relay_trip,
+        relay_message,
+    )
 
-    # Print the result so Render Logs clearly show
-    # whether Twilio accepted or rejected the SMS.
-    print(f"[SMS ALERT] IED Status: {ied_status}")
-    print(f"[SMS ALERT] Twilio result: {result}")
+    # -----------------------------
+    # 2. Overcurrent
+    # -----------------------------
+    overcurrent = bool(data.overcurrent_fault)
+
+    # Also independently verify from measured current and pickup.
+    # This catches cases where the ESP32 status flag is not populated
+    # correctly but the current is already above the configured pickup.
+    try:
+        pickup_phase = float(data.pickup_phase)
+        if pickup_phase > 0:
+            overcurrent = overcurrent or (
+                i1 > pickup_phase
+                or i2 > pickup_phase
+                or i3 > pickup_phase
+            )
+    except (TypeError, ValueError):
+        pass
+
+    oc_message = (
+        f"MV PANEL ALERT - {panel_id}\n"
+        f"OVERCURRENT FAULT\n"
+        f"I1={i1:.2f}A I2={i2:.2f}A\n"
+        f"I3={i3:.2f}A\n"
+        f"Pickup={float(data.pickup_phase):.2f}A"
+    )
+
+    _send_alert_on_rising_edge(
+        panel_id,
+        "overcurrent",
+        overcurrent,
+        oc_message,
+    )
+
+    # -----------------------------
+    # 3. Earth fault
+    # -----------------------------
+    earth_fault = bool(data.earth_fault)
+
+    try:
+        pickup_earth = float(data.pickup_earth)
+        if pickup_earth > 0:
+            earth_fault = earth_fault or (i0 > pickup_earth)
+    except (TypeError, ValueError):
+        pass
+
+    ef_message = (
+        f"MV PANEL ALERT - {panel_id}\n"
+        f"EARTH FAULT\n"
+        f"I0={i0:.2f}A\n"
+        f"Pickup={float(data.pickup_earth):.2f}A"
+    )
+
+    _send_alert_on_rising_edge(
+        panel_id,
+        "earth_fault",
+        earth_fault,
+        ef_message,
+    )
+
+    # -----------------------------
+    # 4. High temperature
+    # -----------------------------
+    temperature = float(data.temperature)
+    high_temperature = (
+        not _is_nan_or_inf(temperature)
+        and temperature > HIGH_TEMP
+    )
+
+    temperature_message = (
+        f"MV PANEL ALERT - {panel_id}\n"
+        f"HIGH TEMPERATURE\n"
+        f"Temperature={temperature:.1f} C\n"
+        f"Limit={HIGH_TEMP:.1f} C"
+    )
+
+    _send_alert_on_rising_edge(
+        panel_id,
+        "high_temperature",
+        high_temperature,
+        temperature_message,
+    )
+
+    # -----------------------------
+    # 5. High humidity
+    # -----------------------------
+    humidity = float(data.humidity)
+    high_humidity = (
+        not _is_nan_or_inf(humidity)
+        and humidity > HIGH_HUM
+    )
+
+    humidity_message = (
+        f"MV PANEL ALERT - {panel_id}\n"
+        f"HIGH HUMIDITY\n"
+        f"Humidity={humidity:.1f} %\n"
+        f"Limit={HIGH_HUM:.1f} %"
+    )
+
+    _send_alert_on_rising_edge(
+        panel_id,
+        "high_humidity",
+        high_humidity,
+        humidity_message,
+    )
+
+
+def _is_nan_or_inf(value: float) -> bool:
+    """Avoid adding another dependency just to validate sensor floats."""
+    return value != value or value in (float("inf"), float("-inf"))
 
 app = FastAPI()
 
@@ -571,16 +764,43 @@ VALUES
     cursor.close()
     conn.close()
 
-    # Send an SMS only when this panel changes from normal -> fault.
-    # Any Twilio failure is intentionally ignored so sensor ingestion
-    # continues normally.
-    send_fault_alert_if_needed(data)
+    # Check relay, overcurrent, earth-fault, temperature and humidity alerts.
+    # SMS failures are logged but do not interrupt database storage.
+    send_alerts_if_needed(data)
 
     return {
         "status": "Data Stored Successfully",
         "received_data": data
     }
 
+
+
+# -----------------------------
+# GET /sms-status - configuration diagnostic
+# -----------------------------
+@app.get("/sms-status")
+def sms_status():
+    """
+    Safe diagnostic endpoint.
+    It reports whether the required Twilio variables are present,
+    without exposing the Auth Token.
+    """
+    return {
+        "configured": all([
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN,
+            TWILIO_FROM_NUMBER,
+            TWILIO_TO_NUMBER,
+        ]),
+        "account_sid_configured": bool(TWILIO_ACCOUNT_SID),
+        "auth_token_configured": bool(TWILIO_AUTH_TOKEN),
+        "from_number_configured": bool(TWILIO_FROM_NUMBER),
+        "to_number_configured": bool(TWILIO_TO_NUMBER),
+        "from_number": TWILIO_FROM_NUMBER or None,
+        "to_number": TWILIO_TO_NUMBER or None,
+        "high_temperature_limit": HIGH_TEMP,
+        "high_humidity_limit": HIGH_HUM,
+    }
 
 
 # -----------------------------
@@ -607,6 +827,7 @@ def send_sms(data: SMSRequest):
     return {
         "status": "SMS sent successfully",
         "to": data.to or TWILIO_TO_NUMBER,
+        "twilio_response": result.get("response"),
     }
 
 
