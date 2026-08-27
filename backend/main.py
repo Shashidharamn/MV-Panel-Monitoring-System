@@ -4,7 +4,104 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, Tuple, List
+import os
+import base64
+import urllib.parse
+import urllib.request
 from db import get_connection
+
+
+# -----------------------------
+# Twilio SMS configuration
+# Keep these values in Render Environment Variables.
+# Do NOT hard-code the Auth Token in this file.
+# -----------------------------
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("+17372212163")
+TWILIO_TO_NUMBER = os.getenv("+918867238293")
+
+# Prevent an SMS from being sent on every ESP32 reading.
+# An alert is sent only when a panel changes from normal -> fault.
+_last_fault_state = {}
+
+
+def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
+    """Send one SMS through Twilio's REST API."""
+    sid = TWILIO_ACCOUNT_SID
+    token = TWILIO_AUTH_TOKEN
+    from_number = TWILIO_FROM_NUMBER
+    to_number = to_number or TWILIO_TO_NUMBER
+
+    if not all([sid, token, from_number, to_number]):
+        return {
+            "success": False,
+            "message": "Twilio environment variables are not configured."
+        }
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    payload = urllib.parse.urlencode({
+        "To": to_number,
+        "From": from_number,
+        "Body": body,
+    }).encode("utf-8")
+
+    credentials = base64.b64encode(
+        f"{sid}:{token}".encode("utf-8")
+    ).decode("ascii")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = response.read().decode("utf-8")
+        return {"success": True, "response": result}
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
+
+
+def is_active_fault(status: Optional[str]) -> bool:
+    return str(status or "").strip().lower().startswith("fault detected")
+
+
+def send_fault_alert_if_needed(data: "SensorData") -> None:
+    """Send one SMS when a panel enters a fault state."""
+    panel_id = data.panel_id
+    fault_status = (
+        data.live_fault_status
+        or data.fault_status
+        or "No Fault Detected"
+    )
+    active = is_active_fault(fault_status)
+    previous = _last_fault_state.get(panel_id, False)
+
+    # Store the latest state first. This avoids repeated SMS messages
+    # while the same fault remains active.
+    _last_fault_state[panel_id] = active
+
+    if not active or previous:
+        return
+
+    message = (
+        f"MV PANEL ALERT - {panel_id}\n"
+        f"{fault_status}\n"
+        f"I1={data.relay_i1:.2f}A "
+        f"I2={data.relay_i2:.2f}A "
+        f"I3={data.relay_i3:.2f}A "
+        f"I0={data.relay_i0:.2f}A"
+    )
+
+    # SMS failure must never stop sensor data from being stored.
+    send_twilio_sms(message)
+
 
 app = FastAPI()
 
@@ -158,7 +255,10 @@ class SensorData(BaseModel):
     negative_sequence_current: float
     thermal_level: int
 
-    current_relay_status: str
+    # IED status from the new ESP code. The database continues to use
+    # current_relay_status, so no database schema change is required.
+    current_relay_status: Optional[str] = None
+    ied_status: Optional[str] = None
 
     # Fault Record 1 - Pre-start
     fr_prestart_i1: float
@@ -209,6 +309,15 @@ def receive_data(data: SensorData):
 
     conn = get_connection()
     cursor = conn.cursor()
+
+    # New ESP sends the IED status through current_relay_status.
+    # Accept ied_status as an optional alias as well, without changing
+    # the existing PostgreSQL schema.
+    relay_status = (
+        data.current_relay_status
+        or data.ied_status
+        or "N/A"
+    )
 
     cursor.execute("""
         INSERT INTO sensor_data
@@ -379,7 +488,7 @@ VALUES
     data.negative_sequence_current,
     data.thermal_level,
 
-    data.current_relay_status,
+    relay_status,
 
     data.fr_prestart_i1,
     data.fr_prestart_i2,
@@ -414,9 +523,42 @@ VALUES
     cursor.close()
     conn.close()
 
+    # Send an SMS only when this panel changes from normal -> fault.
+    # Any Twilio failure is intentionally ignored so sensor ingestion
+    # continues normally.
+    send_fault_alert_if_needed(data)
+
     return {
         "status": "Data Stored Successfully",
         "received_data": data
+    }
+
+
+
+# -----------------------------
+# POST /send-sms - manual SMS test
+# -----------------------------
+class SMSRequest(BaseModel):
+    message: str
+    to: Optional[str] = None
+
+
+@app.post("/send-sms")
+def send_sms(data: SMSRequest):
+    if not data.message.strip():
+        raise HTTPException(status_code=400, detail="message is required.")
+
+    result = send_twilio_sms(data.message.strip(), data.to)
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=result.get("message", "SMS could not be sent.")
+        )
+
+    return {
+        "status": "SMS sent successfully",
+        "to": data.to or TWILIO_TO_NUMBER,
     }
 
 
@@ -682,10 +824,13 @@ def latest_data(panel_id: Optional[str] = Query(None)):
             "i2": flat["relay_i2"],
             "i3": flat["relay_i3"],
             "i0": flat["relay_i0"],
+            "op_counter": flat["operation_counter"],
             "neg_seq": flat["negative_sequence_current"],
             "thermal_level": flat["thermal_level"],
-            "ied_status": flat["current_relay_status"],
             "rtc": flat["relay_rtc"],
+            # Expose the new ESP's IED status through the existing API.
+            "status": flat["current_relay_status"],
+            "current_relay_status": flat["current_relay_status"],
             "live_fault_status": fault_status_text,
             "event": {
                 "type": flat["event_type"],
