@@ -87,36 +87,48 @@ def send_twilio_sms(body: str, to_number: Optional[str] = None) -> dict:
 
 
 def is_active_fault(status: Optional[str]) -> bool:
-    return str(status or "").strip().lower().startswith("fault detected")
+    status = str(status or "").strip().lower()
+
+    return (
+        "phase trip" in status
+        or "earth trip" in status
+        or "internal relay fault" in status
+    )
 
 
 def send_fault_alert_if_needed(data: "SensorData") -> None:
-    """Send one SMS when a panel enters a fault state."""
+    """Send one SMS when the IED enters a fault state."""
+
     panel_id = data.panel_id
-    fault_status = (
-        data.live_fault_status
-        or data.fault_status
-        or "No Fault Detected"
-    )
-    active = is_active_fault(fault_status)
+
+    # Use IED status ONLY for SMS triggering
+    ied_status = (
+        data.current_relay_status
+        or data.ied_status
+        or ""
+    ).strip()
+
+    active = is_active_fault(ied_status)
     previous = _last_fault_state.get(panel_id, False)
 
-    # Store the latest state first. This avoids repeated SMS messages
-    # while the same fault remains active.
+    # Remember current state to prevent repeated SMS
     _last_fault_state[panel_id] = active
 
+    # No fault, or fault already notified
     if not active or previous:
         return
 
     message = (
         f"MV PANEL ALERT - {panel_id}\n"
-        f"{fault_status}\n"
+        f"IED Status: {ied_status}\n"
         f"I1={data.relay_i1:.2f}A "
         f"I2={data.relay_i2:.2f}A "
         f"I3={data.relay_i3:.2f}A "
         f"I0={data.relay_i0:.2f}A"
     )
 
+
+    
     # SMS failure must never stop sensor data from being stored.
     send_twilio_sms(message)
 
